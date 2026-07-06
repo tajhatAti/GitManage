@@ -325,6 +325,7 @@ async def _(e):
 
         except asyncio.TimeoutError:
             await e.reply("⏰ Timeout. Use `/add_account` again.")
+
 # ── /create (conversational) ──────────────────────────────────────────────────
 @bot.on(events.NewMessage(pattern="^/create$"))
 async def _(e):
@@ -570,6 +571,48 @@ async def _(e):
         return await e.answer("Access denied.", alert=True)
 
     data = e.data.decode()
+
+    # ── Owner selection after add_account ──
+    if data.startswith("sel_owner_"):
+        parts = data[10:].split("|||", 1)
+        if len(parts) < 2:
+            return await e.answer("Invalid data.", alert=True)
+
+        owner_id_selected = parts[0]
+        api_key_saved     = parts[1]
+
+        # Fetch owner name
+        st, odata = await r_get("/owners?limit=10", api_key=api_key_saved)
+        render_name = owner_id_selected
+        if st == 200:
+            for item in (odata if isinstance(odata, list) else []):
+                o = item.get("owner", item)
+                if o.get("id") == owner_id_selected:
+                    render_name = o.get("name", owner_id_selected)
+                    break
+
+        accounts  = load_accounts()
+        acct_name = render_name.replace(" ", "_").lower()
+        base      = acct_name; counter = 1
+        while acct_name in accounts:
+            acct_name = f"{base}_{counter}"; counter += 1
+
+        accounts[acct_name] = {
+            "api_key":     api_key_saved,
+            "owner_id":    owner_id_selected,
+            "render_name": render_name
+        }
+        save_accounts(accounts)
+
+        await e.answer(f"Account {acct_name} saved!")
+        await e.edit(
+            f"✅ **Account Added!**\n\n"
+            f"Name: `{acct_name}`\n"
+            f"Render Name: `{render_name}`\n"
+            f"Owner ID: `{owner_id_selected}`",
+            buttons=[[Button.inline(f"🔄 Switch to {acct_name}", f"sw_{acct_name}")]]
+        )
+        return
 
     # ── quick manage from list ──
     if data.startswith("mg_"):
