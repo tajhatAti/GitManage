@@ -1,2 +1,3 @@
-Telethon
-aiohttp
+telethon==1.36.0
+aiohttp==3.9.5
+cryptg==0.4.0
