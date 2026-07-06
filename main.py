@@ -1,900 +1,550 @@
-import os, asyncio, threading, json, re
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import os
+import json
+import asyncio
+import logging
+from aiohttp import web, ClientSession, ClientTimeout
 from telethon import TelegramClient, events, Button
-from telethon.errors import AlreadyInConversationError
-import aiohttp
 
-# ── ENV ───────────────────────────────────────────────────────────────────────
-API_ID           = int(os.environ.get("API_ID", 0))
-API_HASH         = os.environ.get("API_HASH", "")
-BOT_TOKEN        = os.environ.get("BOT_TOKEN", "")
-OWNER_ID         = int(os.environ.get("OWNER_ID", 0))
-DEFAULT_API_KEY  = os.environ.get("RENDER_API_KEY", "")
-DEFAULT_OWNER_ID = os.environ.get("RENDER_OWNER_ID", "")
-UPTIME_KEY       = os.environ.get("UPTIME_API_KEY", "")
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("render-manager")
 
-# Env vars to auto-inject into every new service
-AUTO_INJECT_ENVS = {
-    "INJECT_KEY_1": os.environ.get("INJECT_KEY_1", ""),
-    "INJECT_KEY_2": os.environ.get("INJECT_KEY_2", ""),
-}
+# ---------------- CONFIG (all from environment, no hardcoded secrets) ----------------
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+OWNER_IDS = {int(x) for x in os.environ.get("OWNER_IDS", "").split(",") if x.strip()}
+UPTIMEROBOT_API_KEY = os.environ.get("UPTIMEROBOT_API_KEY", "")
+PORT = int(os.environ.get("PORT", 8080))
 
 ACCOUNTS_FILE = "accounts.json"
 SERVICES_FILE = "services.json"
-RENDER_BASE   = "https://api.render.com/v1"
-UPTIME_BASE   = "https://api.uptimerobot.com/v2"
-CONV_TIMEOUT  = 120
 
-bot = TelegramClient("render_v3_bot", API_ID, API_HASH)
+RENDER_BASE = "https://api.render.com/v1"
+UR_BASE = "https://api.uptimerobot.com/v2"
 
-# ── ACTIVE ACCOUNT STATE ──────────────────────────────────────────────────────
-active = {
-    "name":     "default",
-    "api_key":  DEFAULT_API_KEY,
-    "owner_id": DEFAULT_OWNER_ID
-}
+client = TelegramClient("render_manager_bot", API_ID, API_HASH)
 
-# ── WEB SERVER ────────────────────────────────────────────────────────────────
-class _H(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK")
-    def log_message(self, *a): pass
+# in-memory conversation state and active-account selection per user
+user_state = {}      # user_id -> {"step": str, "data": dict}
+active_account = {}  # user_id -> account_tag
 
-def run_server():
-    HTTPServer(('0.0.0.0', int(os.environ.get("PORT", 8080))), _H).serve_forever()
-
-# ── JSON HELPERS ──────────────────────────────────────────────────────────────
-def load_accounts() -> dict:
-    if os.path.exists(ACCOUNTS_FILE):
-        try:
-            with open(ACCOUNTS_FILE) as f: return json.load(f)
-        except: pass
-    return {}
-
-def save_accounts(data: dict):
-    with open(ACCOUNTS_FILE, "w") as f: json.dump(data, f, indent=2)
-
-def load_services() -> dict:
-    if os.path.exists(SERVICES_FILE):
-        try:
-            with open(SERVICES_FILE) as f: return json.load(f)
-        except: pass
-    return {}
-
-def save_services(data: dict):
-    with open(SERVICES_FILE, "w") as f: json.dump(data, f, indent=2)
-
-# ── CURRENT KEY ───────────────────────────────────────────────────────────────
-def current_key() -> str:
-    return active.get("api_key") or DEFAULT_API_KEY
-
-def current_owner_id() -> str:
-    return active.get("owner_id") or DEFAULT_OWNER_ID
-
-# ── RENDER HEADERS ────────────────────────────────────────────────────────────
-def rh(api_key: str = None) -> dict:
-    return {
-        "Authorization": f"Bearer {api_key or current_key()}",
-        "Accept":        "application/json",
-        "Content-Type":  "application/json"
-    }
-
-def extract_err(data) -> str:
-    if isinstance(data, dict):
-        return data.get("message", json.dumps(data))[:300]
-    return str(data)[:300]
-
-# ── RENDER HTTP ───────────────────────────────────────────────────────────────
-async def r_get(path: str, api_key: str = None):
-    async with aiohttp.ClientSession() as s:
-        async with s.get(
-            f"{RENDER_BASE}{path}", headers=rh(api_key),
-            timeout=aiohttp.ClientTimeout(total=30)
-        ) as r:
-            try: data = await r.json(content_type=None)
-            except: data = await r.text()
-            return r.status, data
-
-async def r_post(path: str, payload: dict = {}, api_key: str = None):
-    async with aiohttp.ClientSession() as s:
-        async with s.post(
-            f"{RENDER_BASE}{path}", headers=rh(api_key), json=payload,
-            timeout=aiohttp.ClientTimeout(total=30)
-        ) as r:
-            try: data = await r.json(content_type=None)
-            except: data = await r.text()
-            return r.status, data
-
-async def r_put(path: str, payload, api_key: str = None):
-    async with aiohttp.ClientSession() as s:
-        async with s.put(
-            f"{RENDER_BASE}{path}", headers=rh(api_key), json=payload,
-            timeout=aiohttp.ClientTimeout(total=30)
-        ) as r:
-            try: data = await r.json(content_type=None)
-            except: data = await r.text()
-            return r.status, data
-
-async def r_delete(path: str, api_key: str = None):
-    async with aiohttp.ClientSession() as s:
-        async with s.delete(
-            f"{RENDER_BASE}{path}", headers=rh(api_key),
-            timeout=aiohttp.ClientTimeout(total=30)
-        ) as r:
-            try: data = await r.json(content_type=None)
-            except: data = await r.text()
-            return r.status, data
-
-# ── UPTIMEROBOT ───────────────────────────────────────────────────────────────
-async def ut_new_monitor(name: str, url: str) -> str | None:
-    if not UPTIME_KEY: return None
+# ---------------- JSON helpers ----------------
+def load_json(path):
+    if not os.path.exists(path):
+        return {}
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(
-                f"{UPTIME_BASE}/newMonitor",
-                data={"api_key": UPTIME_KEY, "format": "json", "type": 1,
-                      "url": url, "friendly_name": name},
-                timeout=aiohttp.ClientTimeout(total=20)
-            ) as r:
-                data = await r.json(content_type=None)
-        if data.get("stat") == "ok":
-            return str(data.get("monitor", {}).get("id", ""))
-    except: pass
-    return None
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-async def ut_edit_monitor(monitor_id: str, status: int):
-    if not UPTIME_KEY or not monitor_id: return
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+def get_accounts():
+    return load_json(ACCOUNTS_FILE)
+
+def get_services():
+    return load_json(SERVICES_FILE)
+
+# ---------------- Access control ----------------
+def is_owner(uid):
+    return uid in OWNER_IDS
+
+def get_active_key(uid):
+    tag = active_account.get(uid)
+    accounts = get_accounts()
+    if not tag or tag not in accounts:
+        return None, None
+    return tag, accounts[tag]["api_key"]
+
+# ---------------- Render API helpers ----------------
+async def render_request(method, path, api_key, json_body=None, params=None):
+    url = f"{RENDER_BASE}{path}"
+    headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
     try:
-        async with aiohttp.ClientSession() as s:
-            await s.post(
-                f"{UPTIME_BASE}/editMonitor",
-                data={"api_key": UPTIME_KEY, "format": "json",
-                      "id": monitor_id, "status": status},
-                timeout=aiohttp.ClientTimeout(total=20)
-            )
-    except: pass
+        async with asyncio.timeout(10):
+            async with ClientSession(timeout=ClientTimeout(total=10)) as session:
+                async with session.request(method, url, headers=headers, json=json_body, params=params) as resp:
+                    text = await resp.text()
+                    try:
+                        data = json.loads(text) if text else None
+                    except json.JSONDecodeError:
+                        data = text
+                    return resp.status, data
+    except asyncio.TimeoutError:
+        return 408, "Request timed out after 10 seconds"
+    except Exception as e:
+        return 599, str(e)
 
-async def ut_delete_monitor(monitor_id: str):
-    if not UPTIME_KEY or not monitor_id: return
-    try:
-        async with aiohttp.ClientSession() as s:
-            await s.post(
-                f"{UPTIME_BASE}/deleteMonitor",
-                data={"api_key": UPTIME_KEY, "format": "json", "id": monitor_id},
-                timeout=aiohttp.ClientTimeout(total=20)
-            )
-    except: pass
+async def verify_render_key(api_key):
+    status, data = await render_request("GET", "/owners", api_key)
+    return status, data
 
-# ── SERVICE ALIAS RESOLVER ────────────────────────────────────────────────────
-async def resolve_service(identifier: str) -> tuple[str | None, str | None]:
-    """Returns (service_id, service_name) or (None, None)"""
-    identifier = identifier.strip()
-    svcs = load_services()
+async def render_list_services(api_key, owner_id=None):
+    params = {"limit": 100}
+    if owner_id:
+        params["ownerId"] = owner_id
+    return await render_request("GET", "/services", api_key, params=params)
 
-    # Check if it's a saved name
-    if identifier in svcs:
-        sid  = svcs[identifier]["id"]
-        return sid, identifier
+async def render_get_service(api_key, service_id):
+    return await render_request("GET", f"/services/{service_id}", api_key)
 
-    # Check if any service has this id saved
-    for name, val in svcs.items():
-        if isinstance(val, dict) and val.get("id") == identifier:
-            return identifier, name
-
-    # Try fetching from Render API directly
-    if identifier.startswith("srv-"):
-        status, data = await r_get(f"/services/{identifier}")
-        if status == 200:
-            svc   = data.get("service", data) if isinstance(data, dict) else {}
-            sname = svc.get("name", identifier)
-            svcs[sname] = {"id": identifier, "monitor_id": svcs.get(sname, {}).get("monitor_id")}
-            save_services(svcs)
-            return identifier, sname
-
-    return None, None
-
-# ── MANAGE KEYBOARD ───────────────────────────────────────────────────────────
-def manage_kb(sid: str):
-    return [
-        [Button.inline("📊 Status",       f"st_{sid}"),
-         Button.inline("📜 Logs",         f"lg_{sid}")],
-        [Button.inline("➕ Add Env",      f"ev_{sid}"),
-         Button.inline("🚀 Deploy",       f"dp_{sid}")],
-        [Button.inline("⏸️ Suspend",      f"sp_{sid}"),
-         Button.inline("▶️ Resume",       f"rs_{sid}")],
-        [Button.inline("⏱️ Custom Sleep", f"sl_{sid}")],
-        [Button.inline("🗑️ Delete",       f"dl_{sid}")]
-    ]
-
-def accounts_kb(accounts: dict, active_name: str):
-    buttons = []
-    for name, data in accounts.items():
-        icon = "✅ " if name == active_name else ""
-        label = f"{icon}{name} ({data.get('render_name','—')})"
-        buttons.append([Button.inline(label, f"sw_{name}")])
-    if DEFAULT_API_KEY:
-        icon = "✅ " if active_name == "default" else ""
-        buttons.append([Button.inline(f"{icon}default (env)", "sw_default")])
-    buttons.append([Button.inline("➕ Add Account", "add_acct_btn")])
-    return buttons
-
-# ── DURATION PARSER ───────────────────────────────────────────────────────────
-def parse_duration(text: str) -> tuple[int | None, str | None]:
-    m = re.match(r'^(\d+)(h|m|s)$', text.strip().lower())
-    if not m: return None, None
-    val, unit = int(m.group(1)), m.group(2)
-    secs  = val * (3600 if unit=='h' else 60 if unit=='m' else 1)
-    label = f"{val} {'hour(s)' if unit=='h' else 'minute(s)' if unit=='m' else 'second(s)'}"
-    return secs, label
-
-# ── SLEEP TASK ────────────────────────────────────────────────────────────────
-async def sleep_and_wake(sid: str, monitor_id: str, seconds: int, api_key: str, label: str):
-    await bot.send_message(OWNER_ID,
-        f"⏸️ **Sleeping for {label}**\nService: `{sid}`\nWill auto-wake.")
-    await asyncio.sleep(seconds)
-    await r_post(f"/services/{sid}/resume", api_key=api_key)
-    if monitor_id: await ut_edit_monitor(monitor_id, 1)
-    await bot.send_message(OWNER_ID,
-        f"✅ **Woke Up!**\nService: `{sid}`\nMonitor resumed.")
-
-# ── OWNER CHECK ───────────────────────────────────────────────────────────────
-def own(e): return e.sender_id == OWNER_ID
-
-# ── /start ────────────────────────────────────────────────────────────────────
-@bot.on(events.NewMessage(pattern="^/start$"))
-async def _(e):
-    if not own(e): return
-    acct = active.get("name","default")
-    await e.reply(
-        "**Render Smart Manager v3**\n\n"
-        f"Active: `{acct}`\n\n"
-        "`/create` — create web service\n"
-        "`/deploy` — deploy service\n"
-        "`/status` — service status\n"
-        "`/manage <name_or_id>` — manage panel\n"
-        "`/services` — list saved services\n"
-        "`/list_render` — fetch from Render\n"
-        "`/accounts` — manage accounts\n"
-        "`/add_account` — add new account\n"
-        "`/whoami` — current account info"
-    )
-
-# ── /accounts ─────────────────────────────────────────────────────────────────
-@bot.on(events.NewMessage(pattern="^/accounts$"))
-async def _(e):
-    if not own(e): return
-    accounts = load_accounts()
-    if not accounts and not DEFAULT_API_KEY:
-        return await e.reply("No accounts. Use `/add_account` or set `RENDER_API_KEY` env var.")
-    await e.reply(
-        "**Accounts**\nTap to switch:",
-        buttons=accounts_kb(accounts, active.get("name","default"))
-    )
-
-# ── /add_account (conversational) ────────────────────────────────────────────
-@bot.on(events.NewMessage(pattern="^/add_account$"))
-async def _(e):
-    if not own(e): return
-    async with bot.conversation(e.chat_id, timeout=CONV_TIMEOUT) as conv:
-        try:
-            await conv.send_message("**Add Account**\n\nSend your **Render API Key**:")
-            r1 = await conv.get_response()
-            api_key_input = r1.text.strip()
-            if not api_key_input:
-                return await conv.send_message("❌ Cancelled.")
-
-            check_msg = await conv.send_message("⏳ Verifying API key and fetching owners...")
-
-            # Test the key and get owners
-            test_status, test_data = await r_get("/owners?limit=10", api_key=api_key_input)
-
-            if test_status == 401:
-                await bot.edit_message(e.chat_id, check_msg.id,
-                    "❌ **Invalid API Key** (401 Unauthorized)\nCheck and try again.")
-                return
-
-            if test_status != 200:
-                await bot.edit_message(e.chat_id, check_msg.id,
-                    f"❌ API returned {test_status}\n`{extract_err(test_data)}`")
-                return
-
-            owners_list = test_data if isinstance(test_data, list) else []
-            if not owners_list:
-                await bot.edit_message(e.chat_id, check_msg.id, "❌ No owners found.")
-                return
-
-            # Build inline buttons for owner selection
-            buttons = []
-            for item in owners_list:
-                o     = item.get("owner", item)
-                oid   = o.get("id", "")
-                oname = o.get("name", "—")
-                otype = o.get("type", "—")
-                buttons.append([Button.inline(
-                    f"{oname} ({otype})",
-                    f"sel_owner_{oid}|||{api_key_input}"
-                )])
-
-            await bot.edit_message(e.chat_id, check_msg.id,
-                "✅ **API Key Valid!**\n\nSelect the **Owner** for this account:",
-                buttons=buttons
-            )
-
-        except asyncio.TimeoutError:
-            await e.reply("⏰ Timeout. Use `/add_account` again.")
-
-# ── /create (conversational) ──────────────────────────────────────────────────
-@bot.on(events.NewMessage(pattern="^/create$"))
-async def _(e):
-    if not own(e): return
-    if not current_key():
-        return await e.reply("❌ No API key. Use `/add_account` or set `RENDER_API_KEY`.")
-
-    async with bot.conversation(e.chat_id, timeout=CONV_TIMEOUT) as conv:
-        try:
-            await conv.send_message("**Create Web Service**\n\nSend the **service name**:")
-            r1   = await conv.get_response()
-            name = r1.text.strip()
-            if not name:
-                return await conv.send_message("❌ Cancelled.")
-
-            await conv.send_message(f"Name: `{name}`\n\nSend the **GitHub repo URL**:")
-            r2   = await conv.get_response()
-            repo = r2.text.strip()
-            if not repo:
-                return await conv.send_message("❌ Cancelled.")
-
-            prog = await conv.send_message(f"⏳ Creating `{name}` on Render...")
-
-            rid = current_owner_id()
-            if not rid:
-                await bot.edit_message(e.chat_id, prog.id,
-                    "❌ No Render Owner ID. Set `RENDER_OWNER_ID` env or add an account.")
-                return
-
-            payload = {
-                "type": "web_service", "name": name,
-                "ownerId": rid, "repo": repo,
-                "autoDeploy": "yes", "branch": "main",
-                "serviceDetails": {
-                    "env": "python",
-                    "region": "singapore",
-                    "plan": "free",
-                    "envSpecificDetails": {
-                        "runtime": "python-3-11",
-                        "buildCommand": "pip install -r requirements.txt",
-                        "startCommand": "python main.py"
-                    }
-                }
-            }
-            st, data = await r_post("/services", payload)
-            if st != 201:
-                await bot.edit_message(e.chat_id, prog.id,
-                    f"❌ Create failed ({st})\n`{extract_err(data)}`")
-                return
-
-            svc   = data.get("service", data) if isinstance(data, dict) else {}
-            sid   = svc.get("id", "—")
-            sname = svc.get("name", name)
-            det   = svc.get("serviceDetails", {})
-            surl  = det.get("url", "")
-
-            await bot.edit_message(e.chat_id, prog.id,
-                f"✅ Service created!\n⏳ Injecting env vars...")
-
-            # Auto-inject envs
-            env_list = [{"key": k, "value": v}
-                        for k, v in AUTO_INJECT_ENVS.items() if v]
-            if env_list:
-                await r_put(f"/services/{sid}/env-vars", env_list)
-
-            # UptimeRobot
-            monitor_id = None
-            ut_txt     = "UptimeRobot: no URL yet"
-            if surl:
-                await bot.edit_message(e.chat_id, prog.id,
-                    f"⏳ Setting up UptimeRobot for `{surl}`...")
-                monitor_id = await ut_new_monitor(sname, surl)
-                ut_txt = f"Monitor ID: `{monitor_id}`" if monitor_id else "UptimeRobot: failed"
-
-            # Save alias
-            svcs = load_services()
-            svcs[sname] = {"id": sid, "monitor_id": monitor_id,
-                           "url": surl, "account": active.get("name","default"),
-                           "api_key": current_key()}
-            save_services(svcs)
-
-            await bot.edit_message(e.chat_id, prog.id,
-                f"🎉 **Service Ready!**\n\n"
-                f"Name: `{sname}`\n"
-                f"ID: `{sid}`\n"
-                f"URL: `{surl or 'Pending...'}`\n"
-                f"Env vars injected: `{len(env_list)}`\n"
-                f"{ut_txt}",
-                buttons=manage_kb(sid)
-            )
-
-        except asyncio.TimeoutError:
-            await e.reply("⏰ Timeout. Use `/create` again.")
-
-# ── /deploy (conversational) ──────────────────────────────────────────────────
-@bot.on(events.NewMessage(pattern="^/deploy$"))
-async def _(e):
-    if not own(e): return
-    async with bot.conversation(e.chat_id, timeout=CONV_TIMEOUT) as conv:
-        try:
-            await conv.send_message("Send **service name or ID** to deploy:")
-            r    = await conv.get_response()
-            inp  = r.text.strip()
-            sid, sname = await resolve_service(inp)
-            if not sid:
-                return await conv.send_message(f"❌ Could not resolve `{inp}`.")
-            svcs    = load_services()
-            svc     = svcs.get(sname or "", {})
-            api_key = svc.get("api_key") or current_key()
-            msg     = await conv.send_message(f"⏳ Deploying `{sname or sid}`...")
-            st, data = await r_post(f"/services/{sid}/deploys", {}, api_key)
-            if st in (200, 201):
-                d   = data.get("deploy", data) if isinstance(data, dict) else {}
-                did = d.get("id","—"); dst = d.get("status","—")
-                await bot.edit_message(e.chat_id, msg.id,
-                    f"✅ **Deploy Triggered!**\n\nID: `{did}`\nStatus: `{dst}`",
-                    buttons=manage_kb(sid))
-            else:
-                await bot.edit_message(e.chat_id, msg.id,
-                    f"❌ Deploy failed ({st})\n`{extract_err(data)}`")
-        except asyncio.TimeoutError:
-            await e.reply("⏰ Timeout.")
-
-# ── /status (conversational) ──────────────────────────────────────────────────
-@bot.on(events.NewMessage(pattern="^/status$"))
-async def _(e):
-    if not own(e): return
-    async with bot.conversation(e.chat_id, timeout=CONV_TIMEOUT) as conv:
-        try:
-            await conv.send_message("Send **service name or ID**:")
-            r   = await conv.get_response()
-            inp = r.text.strip()
-            sid, sname = await resolve_service(inp)
-            if not sid:
-                return await conv.send_message(f"❌ Could not resolve `{inp}`.")
-            svcs    = load_services()
-            svc     = svcs.get(sname or "", {})
-            api_key = svc.get("api_key") or current_key()
-            st, data = await r_get(f"/services/{sid}", api_key)
-            if st == 200:
-                s    = data.get("service", data) if isinstance(data, dict) else {}
-                susp = s.get("suspended","—")
-                det  = s.get("serviceDetails",{})
-                icon = "✅" if susp=="not_suspended" else "⏸️"
-                await conv.send_message(
-                    f"**Status: {sname or sid}**\n\n"
-                    f"State: {icon} `{susp}`\n"
-                    f"URL: `{det.get('url','—')}`\n"
-                    f"Region: `{det.get('region','—')}`\n"
-                    f"Plan: `{det.get('plan','—')}`",
-                    buttons=manage_kb(sid)
-                )
-            else:
-                await conv.send_message(f"❌ Failed ({st})\n`{extract_err(data)}`")
-        except asyncio.TimeoutError:
-            await e.reply("⏰ Timeout.")
-
-# ── /manage ───────────────────────────────────────────────────────────────────
-@bot.on(events.NewMessage(pattern=r"^/manage(?: (.+))?$"))
-async def _(e):
-    if not own(e): return
-    inp = (e.pattern_match.group(1) or "").strip()
-
-    if not inp:
-        async with bot.conversation(e.chat_id, timeout=CONV_TIMEOUT) as conv:
-            try:
-                await conv.send_message("Send **service name or ID**:")
-                r   = await conv.get_response()
-                inp = r.text.strip()
-            except asyncio.TimeoutError:
-                return await e.reply("⏰ Timeout.")
-
-    sid, sname = await resolve_service(inp)
-    if not sid:
-        return await e.reply(f"❌ Could not resolve `{inp}`.")
-
-    svcs = load_services()
-    svc  = svcs.get(sname or "", {})
-    url  = svc.get("url","—"); mid = svc.get("monitor_id","—")
-    await e.reply(
-        f"**Managing: {sname or sid}**\n"
-        f"ID: `{sid}`\nURL: `{url}`\nMonitor: `{mid}`",
-        buttons=manage_kb(sid)
-    )
-
-# ── /services ─────────────────────────────────────────────────────────────────
-@bot.on(events.NewMessage(pattern="^/services$"))
-async def _(e):
-    if not own(e): return
-    svcs = load_services()
-    if not svcs:
-        return await e.reply("No saved services. Use `/create` to add one.")
-    buttons = []
-    for name, val in svcs.items():
-        sid = val.get("id","—") if isinstance(val, dict) else str(val)
-        buttons.append([Button.inline(f"⚙️ {name}", f"mg_{sid}")])
-    await e.reply("**Saved Services**\nTap to manage:", buttons=buttons)
-
-# ── /list_render ──────────────────────────────────────────────────────────────
-@bot.on(events.NewMessage(pattern="^/list_render$"))
-async def _(e):
-    if not own(e): return
-    if not current_key(): return await e.reply("❌ No API key.")
-    msg = await e.reply("⏳ Fetching from Render...")
-    path = "/services?limit=20"
-    if current_owner_id(): path += f"&ownerId={current_owner_id()}"
-    st, data = await r_get(path)
-    if st == 200:
-        services = data if isinstance(data, list) else []
-        if not services: return await msg.edit("No services found on Render.")
-        buttons = []
-        for item in services:
-            svc   = item.get("service", item) if isinstance(item, dict) else {}
-            sname = svc.get("name","—"); sid = svc.get("id","—")
-            susp  = svc.get("suspended","not_suspended")
-            icon  = "✅" if susp == "not_suspended" else "⏸️"
-            buttons.append([Button.inline(f"{icon} {sname}", f"mg_{sid}")])
-        await msg.edit(f"**Render Services ({len(services)})**", buttons=buttons)
-    else:
-        await msg.edit(f"❌ Failed ({st})\n`{extract_err(data)}`")
-
-# ── /whoami ───────────────────────────────────────────────────────────────────
-@bot.on(events.NewMessage(pattern="^/whoami$"))
-async def _(e):
-    if not own(e): return
-    if not current_key(): return await e.reply("❌ No API key.")
-    msg = await e.reply("⏳ Fetching...")
-    st, data = await r_get("/owners?limit=10")
-    if st == 200:
-        owners = data if isinstance(data, list) else []
-        lines  = []
-        for item in owners:
-            o = item.get("owner", item)
-            lines.append(f"• **{o.get('name','—')}** (`{o.get('type','—')}`)\n  ID: `{o.get('id','—')}`")
-        await msg.edit(
-            f"**Active Account:** `{active.get('name','default')}`\n\n"
-            "**Render Owner(s):**\n\n" + "\n\n".join(lines)
-        )
-    else:
-        await msg.edit(f"❌ Failed ({st})\n`{extract_err(data)}`")
-
-# ── CALLBACK QUERY ────────────────────────────────────────────────────────────
-@bot.on(events.CallbackQuery)
-async def _(e):
-    if e.sender_id != OWNER_ID:
-        return await e.answer("Access denied.", alert=True)
-
-    data = e.data.decode()
-
-    # ── Owner selection after add_account ──
-    if data.startswith("sel_owner_"):
-        parts = data[10:].split("|||", 1)
-        if len(parts) < 2:
-            return await e.answer("Invalid data.", alert=True)
-
-        owner_id_selected = parts[0]
-        api_key_saved     = parts[1]
-
-        # Fetch owner name
-        st, odata = await r_get("/owners?limit=10", api_key=api_key_saved)
-        render_name = owner_id_selected
-        if st == 200:
-            for item in (odata if isinstance(odata, list) else []):
-                o = item.get("owner", item)
-                if o.get("id") == owner_id_selected:
-                    render_name = o.get("name", owner_id_selected)
-                    break
-
-        accounts  = load_accounts()
-        acct_name = render_name.replace(" ", "_").lower()
-        base      = acct_name; counter = 1
-        while acct_name in accounts:
-            acct_name = f"{base}_{counter}"; counter += 1
-
-        accounts[acct_name] = {
-            "api_key":     api_key_saved,
-            "owner_id":    owner_id_selected,
-            "render_name": render_name
+async def render_create_service(api_key, name, repo_url, owner_id, env_vars):
+    body = {
+        "type": "web_service",
+        "name": name,
+        "ownerId": owner_id,
+        "repo": repo_url,
+        "branch": "main",
+        "autoDeploy": "yes",
+        "serviceDetails": {
+            "envSpecificDetails": {"buildCommand": "pip install -r requirements.txt", "startCommand": "python main.py"},
+            "plan": "free",
+            "envVars": env_vars
         }
-        save_accounts(accounts)
+    }
+    return await render_request("POST", "/services", api_key, json_body=body)
 
-        await e.answer(f"Account {acct_name} saved!")
-        await e.edit(
-            f"✅ **Account Added!**\n\n"
-            f"Name: `{acct_name}`\n"
-            f"Render Name: `{render_name}`\n"
-            f"Owner ID: `{owner_id_selected}`",
-            buttons=[[Button.inline(f"🔄 Switch to {acct_name}", f"sw_{acct_name}")]]
-        )
-        return
+async def render_deploy(api_key, service_id):
+    return await render_request("POST", f"/services/{service_id}/deploys", api_key, json_body={})
 
-    # ── quick manage from list ──
-    if data.startswith("mg_"):
-        sid = data[3:]
-        sid_resolved, sname = await resolve_service(sid)
-        if not sid_resolved: return await e.answer("Not found.", alert=True)
-        svcs = load_services()
-        svc  = svcs.get(sname or "", {})
-        await e.edit(
-            f"**Managing: {sname or sid}**\n"
-            f"ID: `{sid_resolved}`\n"
-            f"URL: `{svc.get('url','—')}`\n"
-            f"Monitor: `{svc.get('monitor_id','—')}`",
-            buttons=manage_kb(sid_resolved)
-        )
-        return
+async def render_suspend(api_key, service_id):
+    return await render_request("POST", f"/services/{service_id}/suspend", api_key, json_body={})
 
-    # ── account switch ──
-    if data.startswith("sw_"):
-        name = data[3:]
-        if name == "default":
-            if not DEFAULT_API_KEY:
-                return await e.answer("No default key in env.", alert=True)
-            active["name"]     = "default"
-            active["api_key"]  = DEFAULT_API_KEY
-            active["owner_id"] = DEFAULT_OWNER_ID
+async def render_resume(api_key, service_id):
+    return await render_request("POST", f"/services/{service_id}/resume", api_key, json_body={})
+
+async def render_get_env(api_key, service_id):
+    status, data = await render_request("GET", f"/services/{service_id}/env-vars", api_key)
+    if status != 200 or not isinstance(data, list):
+        return status, []
+    normalized = []
+    for item in data:
+        if "envVar" in item:
+            normalized.append(item["envVar"])
         else:
-            accounts = load_accounts()
-            if name not in accounts:
-                return await e.answer("Account not found.", alert=True)
-            acct = accounts[name]
-            active["name"]     = name
-            active["api_key"]  = acct["api_key"]
-            active["owner_id"] = acct["owner_id"]
-        await e.answer(f"Switched to {name}!")
-        await e.edit(
-            f"**Accounts**\nActive: `{active['name']}`",
-            buttons=accounts_kb(load_accounts(), active["name"])
-        )
+            normalized.append(item)
+    return status, normalized
+
+async def render_put_env(api_key, service_id, env_list):
+    body = [{"key": e["key"], "value": e["value"]} for e in env_list]
+    return await render_request("PUT", f"/services/{service_id}/env-vars", api_key, json_body=body)
+
+# ---------------- UptimeRobot helper ----------------
+async def uptimerobot_create_monitor(url, friendly_name):
+    if not UPTIMEROBOT_API_KEY:
+        return None
+    body = {
+        "api_key": UPTIMEROBOT_API_KEY,
+        "format": "json",
+        "type": 1,
+        "url": url,
+        "friendly_name": friendly_name,
+        "interval": 300
+    }
+    try:
+        async with asyncio.timeout(10):
+            async with ClientSession(timeout=ClientTimeout(total=10)) as session:
+                async with session.post(f"{UR_BASE}/newMonitor", data=body) as resp:
+                    return await resp.json()
+    except Exception as e:
+        return {"stat": "fail", "error": str(e)}
+
+# ---------------- Access filter ----------------
+def owner_only(func):
+    async def wrapper(event):
+        if not is_owner(event.sender_id):
+            await event.respond("🚫 Access denied.")
+            return
+        return await func(event)
+    return wrapper
+
+# ---------------- /start ----------------
+@client.on(events.NewMessage(pattern="/start"))
+@owner_only
+async def start_handler(event):
+    await event.respond(
+        "👋 Render & UptimeRobot Smart Manager v5.0\n\n"
+        "/add_account - link a Render account\n"
+        "/accounts - list & switch active account\n"
+        "/env - manage environment variables\n"
+        "/details - account analytics\n"
+        "/create - create a new service\n"
+        "/deploy /suspend /resume - service ops\n"
+        "/manage <name_or_id> - control panel"
+    )
+
+# ---------------- /add_account ----------------
+@client.on(events.NewMessage(pattern="/add_account"))
+@owner_only
+async def add_account_start(event):
+    user_state[event.sender_id] = {"step": "await_tag", "data": {}}
+    await event.respond("Send a short tag/name for this Render account (e.g. `main`, `client1`):")
+
+@client.on(events.NewMessage(pattern="/env$"))
+@owner_only
+async def env_start(event):
+    user_state[event.sender_id] = {"step": "env_await_service", "data": {}}
+    await event.respond("Send the service ID or saved service name:")
+
+@client.on(events.NewMessage(pattern="/details"))
+@owner_only
+async def details_handler(event):
+    uid = event.sender_id
+    tag, api_key = get_active_key(uid)
+    if not api_key:
+        await event.respond("⚠️ No active account selected. Use /accounts first.")
+        return
+    accounts = get_accounts()
+    owner_id = accounts[tag]["owner_id"]
+    status, services = await render_list_services(api_key, owner_id)
+    if status != 200 or not isinstance(services, list):
+        await event.respond(f"❌ Failed to fetch services. Status: {status}\n{services}")
         return
 
-    if data == "add_acct_btn":
-        await e.answer()
-        await bot.send_message(OWNER_ID, "Use `/add_account` command to add a new account.")
+    total = len(services)
+    active, suspended, susp_by_render = 0, 0, 0
+    running_names = []
+    for s in services:
+        svc = s.get("service", s)
+        state = (svc.get("suspended") or "").lower()
+        if state == "not_suspended":
+            active += 1
+            running_names.append(svc.get("name", "unknown"))
+        elif state == "suspended":
+            suspended += 1
+        elif state == "suspended_by_render":
+            susp_by_render += 1
+
+    msg = (
+        f"📊 Account: `{tag}`\n\n"
+        f"Total services: {total}\n"
+        f"✅ Active: {active}\n"
+        f"⏸ Suspended (manual): {suspended}\n"
+        f"⛔ Suspended by Render: {susp_by_render}\n\n"
+        f"Running services:\n" + ("\n".join(f"• {n}" for n in running_names) if running_names else "None")
+    )
+    await event.respond(msg)
+
+@client.on(events.NewMessage(pattern="/accounts"))
+@owner_only
+async def accounts_handler(event):
+    accounts = get_accounts()
+    if not accounts:
+        await event.respond("No accounts saved yet. Use /add_account.")
         return
-        
-    # ── resolve service id from callback ──
-    prefixes = {"st_":8, "lg_":8, "ev_":8, "dp_":8, "sp_":8, "rs_":8, "sl_":8, "dl_":8}
-    sid = None
-    for pfx in ["st_","lg_","ev_","dp_","sp_","rs_","sl_","dl_","cdl_"]:
-        if data.startswith(pfx):
-            sid = data[len(pfx):]
-            break
+    buttons = [[Button.inline(f"{'✅ ' if active_account.get(event.sender_id)==tag else ''}{tag}", f"switch_{tag}")] for tag in accounts]
+    await event.respond("Your saved Render accounts:", buttons=buttons)
 
-    if not sid: return
+@client.on(events.CallbackQuery(pattern=b"switch_(.+)"))
+@owner_only
+async def switch_account_cb(event):
+    tag = event.pattern_match.group(1).decode()
+    active_account[event.sender_id] = tag
+    await event.answer(f"Switched to account: {tag}")
+    await event.edit(f"✅ Active account is now: `{tag}`")
 
-    svcs    = load_services()
-    svc_key = next((k for k,v in svcs.items() if isinstance(v,dict) and v.get("id")==sid), None)
-    svc     = svcs.get(svc_key, {})
-    api_key = svc.get("api_key") or current_key()
-    mid     = svc.get("monitor_id")
-
-    # Status
-    if data.startswith("st_"):
-        await e.answer("Fetching...")
-        st, resp = await r_get(f"/services/{sid}", api_key)
-        if st == 200:
-            s    = resp.get("service", resp) if isinstance(resp, dict) else {}
-            susp = s.get("suspended","—")
-            det  = s.get("serviceDetails",{})
-            icon = "✅" if susp=="not_suspended" else "⏸️"
-            await e.edit(
-                f"**Status**\n\nState: {icon} `{susp}`\n"
-                f"URL: `{det.get('url','—')}`\n"
-                f"Region: `{det.get('region','—')}`\n"
-                f"Plan: `{det.get('plan','—')}`",
-                buttons=manage_kb(sid)
-            )
-        else:
-            await e.edit(f"❌ ({st})\n`{extract_err(resp)}`", buttons=manage_kb(sid))
+# ---------------- /create ----------------
+@client.on(events.NewMessage(pattern="/create$"))
+@owner_only
+async def create_start(event):
+    tag, api_key = get_active_key(event.sender_id)
+    if not api_key:
+        await event.respond("⚠️ No active account selected. Use /accounts first.")
         return
+    user_state[event.sender_id] = {"step": "create_await_name", "data": {}}
+    await event.respond("Send the new service name:")
 
-    # Logs
-    if data.startswith("lg_"):
-        await e.answer("Fetching logs...")
-        st, resp = await r_get(f"/services/{sid}/deploys?limit=5", api_key)
-        if st == 200:
-            deploys = resp if isinstance(resp, list) else []
-            lines   = []
-            for item in deploys:
-                d    = item.get("deploy", item) if isinstance(item, dict) else {}
-                dst  = d.get("status","—"); dtime = d.get("createdAt","—")
-                cmit = d.get("commit",{}); cm = cmit.get("message","—") if isinstance(cmit,dict) else "—"
-                icon = "✅" if dst=="live" else ("❌" if dst=="failed" else "⏳")
-                lines.append(f"{icon} `{dst}` `{str(dtime)[:16]}`\n`{str(cm)[:60]}`")
-            txt = "\n\n".join(lines) if lines else "No deploys found."
-            await e.edit(f"**Deploy Logs**\n\n{txt}", buttons=manage_kb(sid))
-        else:
-            await e.edit(f"❌ ({st})\n`{extract_err(resp)}`", buttons=manage_kb(sid))
+@client.on(events.NewMessage(pattern="/deploy(?: (.+))?"))
+@owner_only
+async def deploy_handler(event):
+    await resolve_and_run(event, render_deploy, "deployed")
+
+@client.on(events.NewMessage(pattern="/suspend(?: (.+))?"))
+@owner_only
+async def suspend_handler(event):
+    await resolve_and_run(event, render_suspend, "suspended")
+
+@client.on(events.NewMessage(pattern="/resume(?: (.+))?"))
+@owner_only
+async def resume_handler(event):
+    await resolve_and_run(event, render_resume, "resumed")
+
+async def resolve_and_run(event, action_fn, verb):
+    arg = event.pattern_match.group(1)
+    if not arg:
+        cmd = event.raw_text.split()[0]
+        user_state[event.sender_id] = {"step": "op_await_target", "data": {"action": verb}}
+        await event.respond(f"Send the service name or ID to {verb.rstrip('ed')}:")
         return
+    await run_action_for_target(event, arg.strip(), action_fn, verb)
 
-    # Add Env
-    if data.startswith("ev_"):
-        await e.answer()
-        await e.edit(
-            f"**Add Env Var** — `{sid}`\n\n"
-            "Reply with: `KEY VALUE`\n\nExample: `PORT 8080`",
-            buttons=[[Button.inline("❌ Cancel", f"mg_{sid}")]]
-        )
-        try:
-            async with bot.conversation(OWNER_ID, timeout=CONV_TIMEOUT) as conv:
-                r = await conv.get_response()
-                if r.text.strip().lower() == "/cancel":
-                    await bot.send_message(OWNER_ID, "Cancelled.")
-                    return
-                parts = r.text.strip().split(None, 1)
-                if len(parts) < 2:
-                    return await bot.send_message(OWNER_ID, "❌ Format: `KEY VALUE`")
-                key, val = parts[0], parts[1]
-                st, envs = await r_get(f"/services/{sid}/env-vars", api_key)
-                existing = envs if isinstance(envs, list) else []
-                env_list = [{"key": i.get("key",""), "value": i.get("value","")} for i in existing]
-                updated  = False
-                for item in env_list:
-                    if item["key"] == key:
-                        item["value"] = val; updated = True; break
-                if not updated: env_list.append({"key": key, "value": val})
-                put_st, _ = await r_put(f"/services/{sid}/env-vars", env_list, api_key)
-                word = "Updated" if updated else "Added"
-                await bot.send_message(
-                    OWNER_ID,
-                    f"✅ **{word}:** `{key}` = `{val}`\nTotal: `{len(env_list)}`",
-                    buttons=manage_kb(sid)
-                )
-        except asyncio.TimeoutError:
-            await bot.send_message(OWNER_ID, "⏰ Timeout.")
+async def run_action_for_target(event, identifier, action_fn, verb):
+    tag, api_key = get_active_key(event.sender_id)
+    if not api_key:
+        await event.respond("⚠️ No active account selected. Use /accounts first.")
         return
-
-    # Deploy
-    if data.startswith("dp_"):
-        await e.answer("Deploying...")
-        st, resp = await r_post(f"/services/{sid}/deploys", {}, api_key)
-        if st in (200, 201):
-            d = resp.get("deploy", resp) if isinstance(resp, dict) else {}
-            await e.edit(
-                f"✅ **Deploy Triggered!**\nID: `{d.get('id','—')}`\nStatus: `{d.get('status','—')}`",
-                buttons=manage_kb(sid)
-            )
-        else:
-            await e.edit(f"❌ Deploy failed ({st})\n`{extract_err(resp)}`", buttons=manage_kb(sid))
-        return
-
-    # Suspend
-    if data.startswith("sp_"):
-        await e.answer("Suspending...")
-        st, resp = await r_post(f"/services/{sid}/suspend", {}, api_key)
-        if st in (200, 204):
-            if mid: await ut_edit_monitor(mid, 0)
-            await e.edit(
-                f"⏸️ **Suspended**\n`{sid}`\nMonitor: {'paused' if mid else 'n/a'}",
-                buttons=manage_kb(sid)
-            )
-        else:
-            await e.edit(f"❌ Suspend failed ({st})\n`{extract_err(resp)}`", buttons=manage_kb(sid))
-        return
-
-    # Resume
-    if data.startswith("rs_"):
-        await e.answer("Resuming...")
-        st, resp = await r_post(f"/services/{sid}/resume", {}, api_key)
-        if st in (200, 204):
-            if mid: await ut_edit_monitor(mid, 1)
-            await e.edit(
-                f"✅ **Resumed**\n`{sid}`\nMonitor: {'resumed' if mid else 'n/a'}",
-                buttons=manage_kb(sid)
-            )
-        elif st == 400:
-            st2, r2 = await r_post(f"/services/{sid}/deploys", {}, api_key)
-            if st2 in (200, 201):
-                if mid: await ut_edit_monitor(mid, 1)
-                await e.edit(f"✅ Deploy triggered (was auto-suspended)\n`{sid}`", buttons=manage_kb(sid))
-            else:
-                await e.edit("❌ Resume + Deploy both failed.", buttons=manage_kb(sid))
-        else:
-            await e.edit(f"❌ Resume failed ({st})\n`{extract_err(resp)}`", buttons=manage_kb(sid))
-        return
-
-    # Custom Sleep
-    if data.startswith("sl_"):
-        await e.answer()
-        await e.edit(
-            f"**Custom Sleep** — `{sid}`\n\n"
-            "Send duration:\n• `2h` = 2 hours\n• `30m` = 30 minutes\n• `60s` = 60 seconds",
-            buttons=[[Button.inline("❌ Cancel", f"mg_{sid}")]]
-        )
-        try:
-            async with bot.conversation(OWNER_ID, timeout=CONV_TIMEOUT) as conv:
-                r = await conv.get_response()
-                secs, label = parse_duration(r.text.strip())
-                if not secs:
-                    return await bot.send_message(OWNER_ID, "❌ Invalid format. Use `2h`, `30m`, or `60s`.")
-                st, _ = await r_post(f"/services/{sid}/suspend", {}, api_key)
-                if st in (200, 204):
-                    if mid: await ut_edit_monitor(mid, 0)
-                    asyncio.create_task(sleep_and_wake(sid, mid, secs, api_key, label))
-                    await bot.send_message(
-                        OWNER_ID,
-                        f"⏸️ **Sleeping for {label}**\n`{sid}`\nWill auto-wake.",
-                        buttons=manage_kb(sid)
-                    )
-                else:
-                    await bot.send_message(OWNER_ID, f"❌ Suspend failed ({st})", buttons=manage_kb(sid))
-        except asyncio.TimeoutError:
-            await bot.send_message(OWNER_ID, "⏰ Timeout.")
-        return
-
-    # Delete
-    if data.startswith("dl_"):
-        await e.answer()
-        await e.edit(
-            f"⚠️ **Confirm Delete**\n`{sid}`\n\nThis cannot be undone!",
-            buttons=[
-                [Button.inline("✅ Yes, Delete", f"cdl_{sid}"),
-                 Button.inline("❌ Cancel",       f"mg_{sid}")]
-            ]
-        )
-        return
-
-    if data.startswith("cdl_"):
-        await e.answer("Deleting...")
-        st, resp = await r_delete(f"/services/{sid}", api_key)
-        if st in (200, 204):
-            if mid: await ut_delete_monitor(mid)
-            if svc_key and svc_key in svcs:
-                del svcs[svc_key]; save_services(svcs)
-            await e.edit(f"🗑️ **Deleted**\n`{sid}`\nMonitor removed.")
-        else:
-            await e.edit(f"❌ Delete failed ({st})\n`{extract_err(resp)}`")
-        return
-
-# ── /uptime command ──
-@bot.on(events.NewMessage(pattern=r"^/uptime (.+)"))
-async def _(e):
-    if not own(e): return
-    url = e.pattern_match.group(1).strip()
-    
-    # URL এর ফরম্যাট চেক
-    if not url.startswith("http"):
-        return await e.reply("❌ URL টি অবশ্যই http:// বা https:// দিয়ে শুরু হতে হবে।")
-
-    msg = await e.reply("⏳ UptimeRobot-এ মনিটর সেটআপ করা হচ্ছে...")
-    
-    # মনিটর তৈরি
-    monitor_id = await ut_new_monitor(f"Service-{e.sender_id}", url)
-    
-    if monitor_id:
-        await msg.edit(f"✅ **সফল!**\nআপনার URL মনিটর করা শুরু হয়েছে।\nMonitor ID: `{monitor_id}`")
+    services = get_services()
+    service_id = services.get(identifier, {}).get("service_id", identifier)
+    status, data = await action_fn(api_key, service_id)
+    if status in (200, 201, 202):
+        await event.respond(f"✅ Service `{identifier}` {verb} successfully.")
     else:
-        await msg.edit("❌ মনিটর তৈরি করতে ব্যর্থ হয়েছে। আপনার UPTIME_API_KEY চেক করুন।")
-   # ut_new_monitor ফাংশনের ভেতরে এই লাইনটি বসান
-print(f"DEBUG: Using Uptime Key: {UPTIME_KEY}")
+        await event.respond(f"❌ Failed to {verb.rstrip('ed')} `{identifier}`. Status: {status}\n{data}")
 
-# ── BOOTSTRAP ─────────────────────────────────────────────────────────────────
+# ---------------- /manage ----------------
+@client.on(events.NewMessage(pattern="/manage(?: (.+))?"))
+@owner_only
+async def manage_handler(event):
+    identifier = event.pattern_match.group(1)
+    if not identifier:
+        await event.respond("Usage: /manage <name_or_id>")
+        return
+    identifier = identifier.strip()
+    buttons = [
+        [Button.inline("📈 Status", f"m_status_{identifier}"), Button.inline("🚀 Deploy", f"m_deploy_{identifier}")],
+        [Button.inline("⏸ Suspend", f"m_suspend_{identifier}"), Button.inline("▶️ Resume", f"m_resume_{identifier}")],
+    ]
+    await event.respond(f"Manage `{identifier}`:", buttons=buttons)
+
+@client.on(events.CallbackQuery(pattern=b"m_(status|deploy|suspend|resume)_(.+)"))
+@owner_only
+async def manage_cb(event):
+    action = event.pattern_match.group(1).decode()
+    identifier = event.pattern_match.group(2).decode()
+    tag, api_key = get_active_key(event.sender_id)
+    if not api_key:
+        await event.answer("No active account.", alert=True)
+        return
+    services = get_services()
+    service_id = services.get(identifier, {}).get("service_id", identifier)
+
+    if action == "status":
+        status, data = await render_get_service(api_key, service_id)
+        if status == 200 and isinstance(data, dict):
+            await event.answer()
+            await event.respond(f"Status of `{identifier}`: {data.get('suspended', 'unknown')}")
+        else:
+            await event.answer(f"Error {status}", alert=True)
+        return
+
+    fn_map = {"deploy": render_deploy, "suspend": render_suspend, "resume": render_resume}
+    status, data = await fn_map[action](api_key, service_id)
+    if status in (200, 201, 202):
+        await event.answer(f"{action.capitalize()} triggered ✅")
+    else:
+        await event.answer(f"Failed: {status}", alert=True)
+
+# ---------------- Env var callback buttons ----------------
+@client.on(events.CallbackQuery(pattern=b"env_(view|add|edit)_(.+)"))
+@owner_only
+async def env_action_cb(event):
+    action = event.pattern_match.group(1).decode()
+    service_id = event.pattern_match.group(2).decode()
+    tag, api_key = get_active_key(event.sender_id)
+    if not api_key:
+        await event.answer("No active account.", alert=True)
+        return
+
+    if action == "view":
+        status, envs = await render_get_env(api_key, service_id)
+        await event.answer()
+        if status != 200:
+            await event.respond(f"❌ Error fetching env vars. Status: {status}")
+            return
+        if not envs:
+            await event.respond("No environment variables set.")
+            return
+        lines = "\n".join(f"`{e['key']}` = `{e.get('value','')}`" for e in envs)
+        await event.respond(f"📄 Environment Variables:\n{lines}")
+
+    elif action == "add":
+        user_state[event.sender_id] = {"step": "env_add_key", "data": {"service_id": service_id}}
+        await event.answer()
+        await event.respond("Send the new variable KEY:")
+
+    elif action == "edit":
+        status, envs = await render_get_env(api_key, service_id)
+        await event.answer()
+        if status != 200 or not envs:
+            await event.respond("No variables to edit.")
+            return
+        buttons = [[Button.inline(e["key"], f"editkey_{service_id}_{e['key']}")] for e in envs]
+        await event.respond("Select a key to edit:", buttons=buttons)
+
+@client.on(events.CallbackQuery(pattern=b"editkey_(.+?)_(.+)"))
+@owner_only
+async def edit_key_cb(event):
+    service_id = event.pattern_match.group(1).decode()
+    key = event.pattern_match.group(2).decode()
+    user_state[event.sender_id] = {"step": "env_edit_value", "data": {"service_id": service_id, "key": key}}
+    await event.answer()
+    await event.respond(f"Send the new value for `{key}`:")
+
+# ---------------- Conversational text router ----------------
+@client.on(events.NewMessage())
+@owner_only
+async def text_router(event):
+    uid = event.sender_id
+    if uid not in user_state:
+        return
+    if event.raw_text.startswith("/"):
+        return
+
+    state = user_state[uid]
+    step = state["step"]
+    text = event.raw_text.strip()
+
+    # --- add_account flow ---
+    if step == "await_tag":
+        state["data"]["tag"] = text
+        state["step"] = "await_owner_id"
+        await event.respond("Send the Render owner ID (starts with `usr-` or `tea-`):")
+
+    elif step == "await_owner_id":
+        state["data"]["owner_id"] = text
+        state["step"] = "await_api_key"
+        await event.respond("Send the Render API key:")
+
+    elif step == "await_api_key":
+        api_key = text
+        await event.respond("🔍 Verifying key...")
+        status, data = await verify_render_key(api_key)
+        if status == 200:
+            accounts = get_accounts()
+            tag = state["data"]["tag"]
+            accounts[tag] = {"owner_id": state["data"]["owner_id"], "api_key": api_key}
+            save_json(ACCOUNTS_FILE, accounts)
+            active_account[uid] = tag
+            await event.respond(f"✅ Account `{tag}` verified and saved. It's now your active account.")
+        else:
+            await event.respond(f"❌ Verification failed. Status: {status}\nReason: {data}")
+        del user_state[uid]
+
+    # --- env: resolve service ---
+    elif step == "env_await_service":
+        services = get_services()
+        service_id = services.get(text, {}).get("service_id", text)
+        buttons = [
+            [Button.inline("📄 View Env", f"env_view_{service_id}")],
+            [Button.inline("➕ Add New", f"env_add_{service_id}")],
+            [Button.inline("✏️ Edit Existing", f"env_edit_{service_id}")],
+        ]
+        await event.respond("Choose an action:", buttons=buttons)
+        del user_state[uid]
+
+    # --- env add ---
+    elif step == "env_add_key":
+        state["data"]["key"] = text
+        state["step"] = "env_add_value"
+        await event.respond("Send the VALUE:")
+
+    elif step == "env_add_value":
+        service_id = state["data"]["service_id"]
+        key = state["data"]["key"]
+        value = text
+        tag, api_key = get_active_key(uid)
+        status, envs = await render_get_env(api_key, service_id)
+        if status != 200:
+            await event.respond(f"❌ Could not fetch existing env vars. Status: {status}")
+            del user_state[uid]
+            return
+        envs = [e for e in envs if e["key"] != key]
+        envs.append({"key": key, "value": value})
+        put_status, put_data = await render_put_env(api_key, service_id, envs)
+        if put_status == 200:
+            await event.respond(f"✅ `{key}` added/updated successfully.")
+        else:
+            await event.respond(f"❌ Failed to update. Status: {put_status}\n{put_data}")
+        del user_state[uid]
+
+    # --- env edit ---
+    elif step == "env_edit_value":
+        service_id = state["data"]["service_id"]
+        key = state["data"]["key"]
+        value = text
+        tag, api_key = get_active_key(uid)
+        status, envs = await render_get_env(api_key, service_id)
+        if status != 200:
+            await event.respond(f"❌ Could not fetch existing env vars. Status: {status}")
+            del user_state[uid]
+            return
+        for e in envs:
+            if e["key"] == key:
+                e["value"] = value
+        put_status, put_data = await render_put_env(api_key, service_id, envs)
+        if put_status == 200:
+            await event.respond(f"✅ `{key}` updated successfully.")
+        else:
+            await event.respond(f"❌ Failed to update. Status: {put_status}\n{put_data}")
+        del user_state[uid]
+
+    # --- create flow ---
+    elif step == "create_await_name":
+        state["data"]["name"] = text
+        state["step"] = "create_await_repo"
+        await event.respond("Send the GitHub repo URL:")
+
+    elif step == "create_await_repo":
+        repo_url = text
+        name = state["data"]["name"]
+        tag, api_key = get_active_key(uid)
+        accounts = get_accounts()
+        owner_id = accounts[tag]["owner_id"]
+
+        env_vars = []
+        # Note: no secrets hardcoded — pull any extra vars you need from your own env
+        status, data = await render_create_service(api_key, name, repo_url, owner_id, env_vars)
+        if status not in (200, 201):
+            await event.respond(f"❌ Creation failed. Status: {status}\n{data}")
+            del user_state[uid]
+            return
+
+        service_id = data.get("service", {}).get("id") or data.get("id")
+        service_url = data.get("service", {}).get("serviceDetails", {}).get("url", "")
+
+        services = get_services()
+        services[name] = {"service_id": service_id, "account_tag": tag}
+        save_json(SERVICES_FILE, services)
+
+        ur_result = None
+        if service_url:
+            ur_result = await uptimerobot_create_monitor(service_url, name)
+
+        msg = f"✅ Service `{name}` created (ID: `{service_id}`)."
+        if ur_result:
+            msg += f"\nUptimeRobot: {ur_result.get('stat', 'unknown')}"
+        await event.respond(msg)
+        del user_state[uid]
+
+    # --- generic op target (deploy/suspend/resume without arg) ---
+    elif step == "op_await_target":
+        verb = state["data"]["action"]
+        fn_map = {"deployed": render_deploy, "suspended": render_suspend, "resumed": render_resume}
+        await run_action_for_target(event, text, fn_map[verb], verb)
+        del user_state[uid]
+
+# ---------------- Keep-alive HTTP server ----------------
+async def handle_root(request):
+    return web.Response(text="Bot is alive", status=200)
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_root)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info(f"Web server running on 0.0.0.0:{PORT}")
+
+# ---------------- Main ----------------
 async def main():
-    threading.Thread(target=run_server, daemon=True).start()
-
-    # Auto-load first saved account if no default env key
-    if not DEFAULT_API_KEY:
-        accounts = load_accounts()
-        if accounts:
-            first = next(iter(accounts))
-            active["name"]     = first
-            active["api_key"]  = accounts[first]["api_key"]
-            active["owner_id"] = accounts[first]["owner_id"]
-            print(f"[+] Auto-loaded account: {first}")
-
-    await bot.start(bot_token=BOT_TOKEN)
-    print("[+] Render Smart Manager v3 online.")
-    await bot.run_until_disconnected()
+    await start_web_server()
+    await client.start(bot_token=BOT_TOKEN)
+    log.info("Bot started.")
+    await client.run_until_disconnected()
 
 if __name__ == "__main__":
     asyncio.run(main())
