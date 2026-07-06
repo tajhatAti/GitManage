@@ -280,27 +280,20 @@ async def _(e):
     if not own(e): return
     async with bot.conversation(e.chat_id, timeout=CONV_TIMEOUT) as conv:
         try:
-            await conv.send_message("Send the **Render Owner ID** for this account:")
+            await conv.send_message("**Add Account**\n\nSend your **Render API Key**:")
             r1 = await conv.get_response()
-            owner_id_input = r1.text.strip()
-            if not owner_id_input:
-                return await conv.send_message("❌ Empty input. Cancelled.")
-
-            await conv.send_message(
-                f"Owner ID: `{owner_id_input}`\n\nNow send the **Render API Key**:"
-            )
-            r2 = await conv.get_response()
-            api_key_input = r2.text.strip()
+            api_key_input = r1.text.strip()
             if not api_key_input:
-                return await conv.send_message("❌ Empty input. Cancelled.")
+                return await conv.send_message("❌ Cancelled.")
 
-            check_msg = await conv.send_message("⏳ Verifying API key...")
+            check_msg = await conv.send_message("⏳ Verifying API key and fetching owners...")
 
-            # Test the key
-            test_status, test_data = await r_get("/owners?limit=5", api_key=api_key_input)
+            # Test the key and get owners
+            test_status, test_data = await r_get("/owners?limit=10", api_key=api_key_input)
+
             if test_status == 401:
                 await bot.edit_message(e.chat_id, check_msg.id,
-                    "❌ **Invalid API Key** (401 Unauthorized)\nPlease check and try again.")
+                    "❌ **Invalid API Key** (401 Unauthorized)\nCheck and try again.")
                 return
 
             if test_status != 200:
@@ -308,38 +301,30 @@ async def _(e):
                     f"❌ API returned {test_status}\n`{extract_err(test_data)}`")
                 return
 
-            # Extract render account name
-            owners_list  = test_data if isinstance(test_data, list) else []
-            render_name  = "—"
-            if owners_list:
-                first_owner = owners_list[0].get("owner", owners_list[0])
-                render_name = first_owner.get("name", "—")
+            owners_list = test_data if isinstance(test_data, list) else []
+            if not owners_list:
+                await bot.edit_message(e.chat_id, check_msg.id, "❌ No owners found.")
+                return
 
-            accounts = load_accounts()
-            acct_name = render_name.replace(" ", "_").lower()
-            base_name = acct_name
-            counter   = 1
-            while acct_name in accounts:
-                acct_name = f"{base_name}_{counter}"; counter += 1
-
-            accounts[acct_name] = {
-                "api_key":     api_key_input,
-                "owner_id":    owner_id_input,
-                "render_name": render_name
-            }
-            save_accounts(accounts)
+            # Build inline buttons for owner selection
+            buttons = []
+            for item in owners_list:
+                o     = item.get("owner", item)
+                oid   = o.get("id", "")
+                oname = o.get("name", "—")
+                otype = o.get("type", "—")
+                buttons.append([Button.inline(
+                    f"{oname} ({otype})",
+                    f"sel_owner_{oid}|||{api_key_input}"
+                )])
 
             await bot.edit_message(e.chat_id, check_msg.id,
-                f"✅ **Account Added!**\n\n"
-                f"Name: `{acct_name}`\n"
-                f"Render Name: `{render_name}`\n"
-                f"Owner ID: `{owner_id_input}`",
-                buttons=[[Button.inline(f"🔄 Switch to {acct_name}", f"sw_{acct_name}")]]
+                "✅ **API Key Valid!**\n\nSelect the **Owner** for this account:",
+                buttons=buttons
             )
 
         except asyncio.TimeoutError:
             await e.reply("⏰ Timeout. Use `/add_account` again.")
-
 # ── /create (conversational) ──────────────────────────────────────────────────
 @bot.on(events.NewMessage(pattern="^/create$"))
 async def _(e):
