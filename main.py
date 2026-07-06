@@ -360,14 +360,17 @@ async def _(e):
                 "ownerId": rid, "repo": repo,
                 "autoDeploy": "yes", "branch": "main",
                 "serviceDetails": {
-                    "env": "python", "region": "singapore",
+                    "env": "python",
+                    "region": "singapore",
                     "plan": "free",
                     "buildCommand": "pip install -r requirements.txt",
-                    "startCommand": "python main.py"
+                    "startCommand": "python main.py",
+                    "envSpecificDetails": {
+                        "runtime": "python-3-11"
+                    }
                 }
             }
             st, data = await r_post("/services", payload)
-
             if st != 201:
                 await bot.edit_message(e.chat_id, prog.id,
                     f"❌ Create failed ({st})\n`{extract_err(data)}`")
