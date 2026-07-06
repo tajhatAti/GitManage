@@ -661,7 +661,7 @@ async def _(e):
         await e.answer()
         await bot.send_message(OWNER_ID, "Use `/add_account` command to add a new account.")
         return
-
+        
     # ── resolve service id from callback ──
     prefixes = {"st_":8, "lg_":8, "ev_":8, "dp_":8, "sp_":8, "rs_":8, "sl_":8, "dl_":8}
     sid = None
@@ -855,6 +855,26 @@ async def _(e):
         else:
             await e.edit(f"❌ Delete failed ({st})\n`{extract_err(resp)}`")
         return
+
+# ── /uptime command ──
+@bot.on(events.NewMessage(pattern=r"^/uptime (.+)"))
+async def _(e):
+    if not own(e): return
+    url = e.pattern_match.group(1).strip()
+    
+    # URL এর ফরম্যাট চেক
+    if not url.startswith("http"):
+        return await e.reply("❌ URL টি অবশ্যই http:// বা https:// দিয়ে শুরু হতে হবে।")
+
+    msg = await e.reply("⏳ UptimeRobot-এ মনিটর সেটআপ করা হচ্ছে...")
+    
+    # মনিটর তৈরি
+    monitor_id = await ut_new_monitor(f"Service-{e.sender_id}", url)
+    
+    if monitor_id:
+        await msg.edit(f"✅ **সফল!**\nআপনার URL মনিটর করা শুরু হয়েছে।\nMonitor ID: `{monitor_id}`")
+    else:
+        await msg.edit("❌ মনিটর তৈরি করতে ব্যর্থ হয়েছে। আপনার UPTIME_API_KEY চেক করুন।")
 
 # ── BOOTSTRAP ─────────────────────────────────────────────────────────────────
 async def main():
