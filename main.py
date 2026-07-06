@@ -363,10 +363,10 @@ async def _(e):
                     "env": "python",
                     "region": "singapore",
                     "plan": "free",
-                    "buildCommand": "pip install -r requirements.txt",
-                    "startCommand": "python main.py",
                     "envSpecificDetails": {
-                        "runtime": "python-3-11"
+                        "runtime": "python-3-11",
+                        "buildCommand": "pip install -r requirements.txt",
+                        "startCommand": "python main.py"
                     }
                 }
             }
