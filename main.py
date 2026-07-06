@@ -875,6 +875,8 @@ async def _(e):
         await msg.edit(f"✅ **সফল!**\nআপনার URL মনিটর করা শুরু হয়েছে।\nMonitor ID: `{monitor_id}`")
     else:
         await msg.edit("❌ মনিটর তৈরি করতে ব্যর্থ হয়েছে। আপনার UPTIME_API_KEY চেক করুন।")
+   # ut_new_monitor ফাংশনের ভেতরে এই লাইনটি বসান
+print(f"DEBUG: Using Uptime Key: {UPTIME_KEY}")
 
 # ── BOOTSTRAP ─────────────────────────────────────────────────────────────────
 async def main():
