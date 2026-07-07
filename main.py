@@ -1,548 +1,814 @@
-import os
-import json
-import asyncio
-import logging
-from aiohttp import web, ClientSession, ClientTimeout
+import os, asyncio, json, base64, threading, itertools, time
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telethon import TelegramClient, events, Button
+import aiohttp
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("render-manager")
+# ============================================================
+# ENVIRONMENT VARIABLES
+# ============================================================
+API_ID    = int(os.environ.get("API_ID", "0"))
+API_HASH  = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+OWNER_ID  = int(os.environ.get("OWNER_ID", "0"))
+PORT      = int(os.environ.get("PORT", 8080))
 
-# ---------------- CONFIG (all from environment, no hardcoded secrets) ----------------
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-OWNER_IDS = {int(x) for x in os.environ.get("OWNER_IDS", "").split(",") if x.strip()}
-UPTIMEROBOT_API_KEY = os.environ.get("UPTIMEROBOT_API_KEY", "")
-PORT = int(os.environ.get("PORT", 8080))
-
+GH_API = "https://api.github.com"
 ACCOUNTS_FILE = "accounts.json"
-SERVICES_FILE = "services.json"
+WORKSPACE_FILE = "workspace.json"
 
-RENDER_BASE = "https://api.render.com/v1"
-UR_BASE = "https://api.uptimerobot.com/v2"
+# ============================================================
+# EVENT LOOP FIX (Python 3.14+)
+# ============================================================
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
 
-# Client is created inside main(), after the event loop exists.
-# Do NOT instantiate TelegramClient at module level — that's what caused
-# "RuntimeError: no running event loop" on Python 3.14.
-client: TelegramClient = None
+bot = TelegramClient("github_bot", API_ID, API_HASH, loop=loop)
 
-# in-memory conversation state and active-account selection per user
-user_state = {}      # user_id -> {"step": str, "data": dict}
-active_account = {}  # user_id -> account_tag
+# ============================================================
+# HTTP HEALTH SERVER
+# ============================================================
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    
+    def log_message(self, *args):
+        pass
 
-# ---------------- JSON helpers ----------------
-def load_json(path):
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+def run_health_server():
+    HTTPServer(('0.0.0.0', PORT), HealthHandler).serve_forever()
 
-def save_json(path, data):
-    with open(path, "w") as f:
+# ============================================================
+# PERSISTENCE
+# ============================================================
+def load_accounts():
+    if os.path.exists(ACCOUNTS_FILE):
+        try:
+            with open(ACCOUNTS_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_accounts(data):
+    with open(ACCOUNTS_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
-def get_accounts():
-    return load_json(ACCOUNTS_FILE)
+def get_account(user_id):
+    return load_accounts().get(str(user_id))
 
-def get_services():
-    return load_json(SERVICES_FILE)
+def update_account(user_id, **kwargs):
+    data = load_accounts()
+    entry = data.get(str(user_id), {})
+    entry.update(kwargs)
+    data[str(user_id)] = entry
+    save_accounts(data)
 
-# ---------------- Access control ----------------
-def is_owner(uid):
-    return uid in OWNER_IDS
+def load_workspace():
+    if os.path.exists(WORKSPACE_FILE):
+        try:
+            with open(WORKSPACE_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
 
-def get_active_key(uid):
-    tag = active_account.get(uid)
-    accounts = get_accounts()
-    if not tag or tag not in accounts:
-        return None, None
-    return tag, accounts[tag]["api_key"]
+def save_workspace(data):
+    with open(WORKSPACE_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
-# ---------------- Render API helpers ----------------
-async def render_request(method, path, api_key, json_body=None, params=None):
-    url = f"{RENDER_BASE}{path}"
-    headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+def get_workspace(user_id):
+    ws = load_workspace()
+    return ws.get(str(user_id), {})
+
+def update_workspace(user_id, **kwargs):
+    ws = load_workspace()
+    entry = ws.get(str(user_id), {})
+    entry.update(kwargs)
+    ws[str(user_id)] = entry
+    save_workspace(ws)
+
+# ============================================================
+# CALLBACK TOKEN CACHE
+# ============================================================
+CB_STORE = {}
+CB_COUNTER = itertools.count()
+
+def cb_put(value):
+    token = str(next(CB_COUNTER))
+    CB_STORE[token] = value
+    if len(CB_STORE) > 5000:
+        for k in list(CB_STORE.keys())[:2500]:
+            CB_STORE.pop(k, None)
+    return token
+
+def cb_get(token):
+    return CB_STORE.get(token)
+
+def cb_data(prefix, value):
+    return f"{prefix}:{cb_put(value)}".encode()
+
+# ============================================================
+# GITHUB API
+# ============================================================
+def gh_headers(token):
+    return {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+
+async def gh_request(method, path, token, json_data=None, params=None):
+    url = f"{GH_API}{path}"
     try:
         async with asyncio.timeout(10):
-            async with ClientSession(timeout=ClientTimeout(total=10)) as session:
-                async with session.request(method, url, headers=headers, json=json_body, params=params) as resp:
-                    text = await resp.text()
+            async with aiohttp.ClientSession() as session:
+                async with session.request(
+                    method, url, headers=gh_headers(token), json=json_data, params=params
+                ) as resp:
                     try:
-                        data = json.loads(text) if text else None
-                    except json.JSONDecodeError:
-                        data = text
+                        data = await resp.json()
+                    except:
+                        data = {}
                     return resp.status, data
     except asyncio.TimeoutError:
-        return 408, "Request timed out after 10 seconds"
+        return 0, {"message": "Request timed out"}
     except Exception as e:
-        return 599, str(e)
+        return -1, {"message": str(e)}
 
-async def verify_render_key(api_key):
-    status, data = await render_request("GET", "/owners", api_key)
-    return status, data
+async def gh_validate_token(token):
+    status, data = await gh_request("GET", "/user", token)
+    if status == 200:
+        return True, data.get("login"), None
+    err = data.get("message", "Unknown error")
+    return False, None, err
 
-async def render_list_services(api_key, owner_id=None):
-    params = {"limit": 100}
-    if owner_id:
-        params["ownerId"] = owner_id
-    return await render_request("GET", "/services", api_key, params=params)
+async def gh_list_repos(token):
+    status, data = await gh_request("GET", "/user/repos", token, params={"per_page": 100, "sort": "updated"})
+    return data if status == 200 else []
 
-async def render_get_service(api_key, service_id):
-    return await render_request("GET", f"/services/{service_id}", api_key)
+async def gh_get_contents(token, repo, path=""):
+    status, data = await gh_request("GET", f"/repos/{repo}/contents/{path}", token)
+    return data if status == 200 else None
 
-async def render_create_service(api_key, name, repo_url, owner_id, env_vars):
-    body = {
-        "type": "web_service",
-        "name": name,
-        "ownerId": owner_id,
-        "repo": repo_url,
-        "branch": "main",
-        "autoDeploy": "yes",
-        "serviceDetails": {
-            "envSpecificDetails": {"buildCommand": "pip install -r requirements.txt", "startCommand": "python main.py"},
-            "plan": "free",
-            "envVars": env_vars
-        }
-    }
-    return await render_request("POST", "/services", api_key, json_body=body)
+async def gh_put_file(token, repo, path, content_str, message, sha=None):
+    encoded = base64.b64encode(content_str.encode()).decode()
+    payload = {"message": message, "content": encoded}
+    if sha:
+        payload["sha"] = sha
+    status, data = await gh_request("PUT", f"/repos/{repo}/contents/{path}", token, json_data=payload)
+    return data if status in (200, 201) else None
 
-async def render_deploy(api_key, service_id):
-    return await render_request("POST", f"/services/{service_id}/deploys", api_key, json_body={})
+async def gh_delete_file(token, repo, path, sha):
+    payload = {"message": f"Delete {path}", "sha": sha}
+    status, data = await gh_request("DELETE", f"/repos/{repo}/contents/{path}", token, json_data=payload)
+    return status == 200
 
-async def render_suspend(api_key, service_id):
-    return await render_request("POST", f"/services/{service_id}/suspend", api_key, json_body={})
+async def gh_create_repo(token, name, private=False):
+    payload = {"name": name, "private": private, "auto_init": True}
+    status, data = await gh_request("POST", "/user/repos", token, json_data=payload)
+    return data if status == 201 else None
 
-async def render_resume(api_key, service_id):
-    return await render_request("POST", f"/services/{service_id}/resume", api_key, json_body={})
+async def gh_get_repo_info(token, repo):
+    status, data = await gh_request("GET", f"/repos/{repo}", token)
+    return data if status == 200 else None
 
-async def render_get_env(api_key, service_id):
-    status, data = await render_request("GET", f"/services/{service_id}/env-vars", api_key)
-    if status != 200 or not isinstance(data, list):
-        return status, []
-    normalized = []
-    for item in data:
-        if "envVar" in item:
-            normalized.append(item["envVar"])
-        else:
-            normalized.append(item)
-    return status, normalized
-
-async def render_put_env(api_key, service_id, env_list):
-    body = [{"key": e["key"], "value": e["value"]} for e in env_list]
-    return await render_request("PUT", f"/services/{service_id}/env-vars", api_key, json_body=body)
-
-# ---------------- UptimeRobot helper ----------------
-async def uptimerobot_create_monitor(url, friendly_name):
-    if not UPTIMEROBOT_API_KEY:
-        return None
-    body = {
-        "api_key": UPTIMEROBOT_API_KEY,
-        "format": "json",
-        "type": 1,
-        "url": url,
-        "friendly_name": friendly_name,
-        "interval": 300
-    }
-    try:
-        async with asyncio.timeout(10):
-            async with ClientSession(timeout=ClientTimeout(total=10)) as session:
-                async with session.post(f"{UR_BASE}/newMonitor", data=body) as resp:
-                    return await resp.json()
-    except Exception as e:
-        return {"stat": "fail", "error": str(e)}
-
-# ---------------- Access filter ----------------
+# ============================================================
+# HELPERS
+# ============================================================
 def owner_only(func):
     async def wrapper(event):
-        if not is_owner(event.sender_id):
-            await event.respond("🚫 Access denied.")
+        if event.sender_id != OWNER_ID:
+            try:
+                await event.respond("⛔ Access Denied")
+            except:
+                pass
             return
         return await func(event)
     return wrapper
 
-# ---------------- Handler registration ----------------
-# All @client.on(...) decorators live inside this function so they only run
-# AFTER client has been created in main(), once the event loop is running.
-def register_handlers():
-
-    @client.on(events.NewMessage(pattern="/start"))
-    @owner_only
-    async def start_handler(event):
-        await event.respond(
-            "👋 Render & UptimeRobot Smart Manager v5.0\n\n"
-            "/add_account - link a Render account\n"
-            "/accounts - list & switch active account\n"
-            "/env - manage environment variables\n"
-            "/details - account analytics\n"
-            "/create - create a new service\n"
-            "/deploy /suspend /resume - service ops\n"
-            "/manage <name_or_id> - control panel"
-        )
-
-    @client.on(events.NewMessage(pattern="/add_account"))
-    @owner_only
-    async def add_account_start(event):
-        user_state[event.sender_id] = {"step": "await_tag", "data": {}}
-        await event.respond("Send a short tag/name for this Render account (e.g. `main`, `client1`):")
-
-    @client.on(events.NewMessage(pattern="/env$"))
-    @owner_only
-    async def env_start(event):
-        user_state[event.sender_id] = {"step": "env_await_service", "data": {}}
-        await event.respond("Send the service ID or saved service name:")
-
-    @client.on(events.NewMessage(pattern="/details"))
-    @owner_only
-    async def details_handler(event):
-        uid = event.sender_id
-        tag, api_key = get_active_key(uid)
-        if not api_key:
-            await event.respond("⚠️ No active account selected. Use /accounts first.")
-            return
-        accounts = get_accounts()
-        owner_id = accounts[tag]["owner_id"]
-        status, services = await render_list_services(api_key, owner_id)
-        if status != 200 or not isinstance(services, list):
-            await event.respond(f"❌ Failed to fetch services. Status: {status}\n{services}")
-            return
-
-        total = len(services)
-        active, suspended, susp_by_render = 0, 0, 0
-        running_names = []
-        for s in services:
-            svc = s.get("service", s)
-            state = (svc.get("suspended") or "").lower()
-            if state == "not_suspended":
-                active += 1
-                running_names.append(svc.get("name", "unknown"))
-            elif state == "suspended":
-                suspended += 1
-            elif state == "suspended_by_render":
-                susp_by_render += 1
-
-        msg = (
-            f"📊 Account: `{tag}`\n\n"
-            f"Total services: {total}\n"
-            f"✅ Active: {active}\n"
-            f"⏸ Suspended (manual): {suspended}\n"
-            f"⛔ Suspended by Render: {susp_by_render}\n\n"
-            f"Running services:\n" + ("\n".join(f"• {n}" for n in running_names) if running_names else "None")
-        )
-        await event.respond(msg)
-
-    @client.on(events.NewMessage(pattern="/accounts"))
-    @owner_only
-    async def accounts_handler(event):
-        accounts = get_accounts()
-        if not accounts:
-            await event.respond("No accounts saved yet. Use /add_account.")
-            return
-        buttons = [[Button.inline(f"{'✅ ' if active_account.get(event.sender_id)==tag else ''}{tag}", f"switch_{tag}")] for tag in accounts]
-        await event.respond("Your saved Render accounts:", buttons=buttons)
-
-    @client.on(events.CallbackQuery(pattern=b"switch_(.+)"))
-    @owner_only
-    async def switch_account_cb(event):
-        tag = event.pattern_match.group(1).decode()
-        active_account[event.sender_id] = tag
-        await event.answer(f"Switched to account: {tag}")
-        await event.edit(f"✅ Active account is now: `{tag}`")
-
-    @client.on(events.NewMessage(pattern="/create$"))
-    @owner_only
-    async def create_start(event):
-        tag, api_key = get_active_key(event.sender_id)
-        if not api_key:
-            await event.respond("⚠️ No active account selected. Use /accounts first.")
-            return
-        user_state[event.sender_id] = {"step": "create_await_name", "data": {}}
-        await event.respond("Send the new service name:")
-
-    @client.on(events.NewMessage(pattern="/deploy(?: (.+))?"))
-    @owner_only
-    async def deploy_handler(event):
-        await resolve_and_run(event, render_deploy, "deployed")
-
-    @client.on(events.NewMessage(pattern="/suspend(?: (.+))?"))
-    @owner_only
-    async def suspend_handler(event):
-        await resolve_and_run(event, render_suspend, "suspended")
-
-    @client.on(events.NewMessage(pattern="/resume(?: (.+))?"))
-    @owner_only
-    async def resume_handler(event):
-        await resolve_and_run(event, render_resume, "resumed")
-
-    @client.on(events.NewMessage(pattern="/manage(?: (.+))?"))
-    @owner_only
-    async def manage_handler(event):
-        identifier = event.pattern_match.group(1)
-        if not identifier:
-            await event.respond("Usage: /manage <name_or_id>")
-            return
-        identifier = identifier.strip()
-        buttons = [
-            [Button.inline("📈 Status", f"m_status_{identifier}"), Button.inline("🚀 Deploy", f"m_deploy_{identifier}")],
-            [Button.inline("⏸ Suspend", f"m_suspend_{identifier}"), Button.inline("▶️ Resume", f"m_resume_{identifier}")],
-        ]
-        await event.respond(f"Manage `{identifier}`:", buttons=buttons)
-
-    @client.on(events.CallbackQuery(pattern=b"m_(status|deploy|suspend|resume)_(.+)"))
-    @owner_only
-    async def manage_cb(event):
-        action = event.pattern_match.group(1).decode()
-        identifier = event.pattern_match.group(2).decode()
-        tag, api_key = get_active_key(event.sender_id)
-        if not api_key:
-            await event.answer("No active account.", alert=True)
-            return
-        services = get_services()
-        service_id = services.get(identifier, {}).get("service_id", identifier)
-
-        if action == "status":
-            status, data = await render_get_service(api_key, service_id)
-            if status == 200 and isinstance(data, dict):
-                await event.answer()
-                await event.respond(f"Status of `{identifier}`: {data.get('suspended', 'unknown')}")
-            else:
-                await event.answer(f"Error {status}", alert=True)
-            return
-
-        fn_map = {"deploy": render_deploy, "suspend": render_suspend, "resume": render_resume}
-        status, data = await fn_map[action](api_key, service_id)
-        if status in (200, 201, 202):
-            await event.answer(f"{action.capitalize()} triggered ✅")
+async def render_file_buttons(items, current_path):
+    buttons = []
+    for item in items:
+        name = item.get("name")
+        path = item.get("path")
+        if item.get("type") == "dir":
+            buttons.append([Button.inline(f"📁 {name}", cb_data("nav", path))])
         else:
-            await event.answer(f"Failed: {status}", alert=True)
+            buttons.append([Button.inline(f"📄 {name}", cb_data("file", path))])
+    
+    if current_path:
+        parent = "/".join(current_path.split("/")[:-1])
+        buttons.append([Button.inline("⬅️ Back", cb_data("nav", parent))])
+    
+    return buttons
 
-    @client.on(events.CallbackQuery(pattern=b"env_(view|add|edit)_(.+)"))
-    @owner_only
-    async def env_action_cb(event):
-        action = event.pattern_match.group(1).decode()
-        service_id = event.pattern_match.group(2).decode()
-        tag, api_key = get_active_key(event.sender_id)
-        if not api_key:
-            await event.answer("No active account.", alert=True)
-            return
+# ============================================================
+# /start
+# ============================================================
+@bot.on(events.NewMessage(pattern=r"^/start$"))
+@owner_only
+async def start_handler(event):
+    await event.respond(
+        "🐙 **GitHub Repo Manager Pro**\n\n"
+        "**Account & Repos**\n"
+        "/add_account - Add GitHub PAT\n"
+        "/whoami - Show current account\n"
+        "/new_repo - Create repository\n"
+        "/switch_repo - Select repo\n\n"
+        "**File Operations**\n"
+        "/files - Browse files\n"
+        "/create_file - Create file\n\n"
+        "**Repository Info**\n"
+        "/repo_info - Repository details\n"
+        "/repo_stats - Stars, forks, etc",
+        parse_mode="markdown"
+    )
 
-        if action == "view":
-            status, envs = await render_get_env(api_key, service_id)
-            await event.answer()
-            if status != 200:
-                await event.respond(f"❌ Error fetching env vars. Status: {status}")
+# ============================================================
+# /add_account
+# ============================================================
+@bot.on(events.NewMessage(pattern=r"^/add_account$"))
+@owner_only
+async def add_account_handler(event):
+    chat_id = event.chat_id
+    try:
+        async with bot.conversation(chat_id, timeout=180) as conv:
+            await conv.send_message(
+                "🔐 **GitHub Account Setup**\n\n"
+                "Send your GitHub Personal Access Token (PAT):\n"
+                "(Needs: repo, user scope)",
+                parse_mode="markdown"
+            )
+            resp = await conv.get_response()
+            pat = resp.raw_text.strip()
+            
+            if not pat or len(pat) < 10:
+                await conv.send_message("❌ Invalid token format")
                 return
-            if not envs:
-                await event.respond("No environment variables set.")
+            
+            await conv.send_message("⏳ Validating token...")
+            valid, username, err = await gh_validate_token(pat)
+            
+            if not valid:
+                await conv.send_message(f"❌ Validation failed:\n{err}")
                 return
-            lines = "\n".join(f"`{e['key']}` = `{e.get('value','')}`" for e in envs)
-            await event.respond(f"📄 Environment Variables:\n{lines}")
+            
+            update_account(OWNER_ID, gh_token=pat, gh_username=username)
+            await conv.send_message(
+                f"✅ **Account Linked Successfully!**\n\n"
+                f"👤 Username: `{username}`\n"
+                f"🔐 Token: `{pat[:20]}...`",
+                parse_mode="markdown"
+            )
+    except asyncio.TimeoutError:
+        await event.respond("⌛ Setup timed out")
+    except Exception as e:
+        await event.respond(f"❌ Error: {e}")
 
-        elif action == "add":
-            user_state[event.sender_id] = {"step": "env_add_key", "data": {"service_id": service_id}}
-            await event.answer()
-            await event.respond("Send the new variable KEY:")
+# ============================================================
+# /whoami
+# ============================================================
+@bot.on(events.NewMessage(pattern=r"^/whoami$"))
+@owner_only
+async def whoami_handler(event):
+    acc = get_account(OWNER_ID)
+    if not acc or not acc.get("gh_token"):
+        await event.respond("⚠️ No account linked. Use /add_account")
+        return
+    
+    ws = get_workspace(OWNER_ID)
+    active_repo = ws.get("active_repo", "None")
+    
+    await event.respond(
+        f"👤 GitHub: **{acc.get('gh_username')}**\n"
+        f"📦 Active Repo: **{active_repo}**\n"
+        f"⏱️ Last Sync: **{int(time.time())}**",
+        parse_mode="markdown"
+    )
 
-        elif action == "edit":
-            status, envs = await render_get_env(api_key, service_id)
-            await event.answer()
-            if status != 200 or not envs:
-                await event.respond("No variables to edit.")
+# ============================================================
+# /new_repo
+# ============================================================
+@bot.on(events.NewMessage(pattern=r"^/new_repo$"))
+@owner_only
+async def new_repo_handler(event):
+    acc = get_account(OWNER_ID)
+    if not acc or not acc.get("gh_token"):
+        await event.respond("⚠️ No account linked. Use /add_account")
+        return
+    
+    chat_id = event.chat_id
+    token = acc["gh_token"]
+    
+    try:
+        async with bot.conversation(chat_id, timeout=180) as conv:
+            await conv.send_message("📦 Send repository name:")
+            resp = await conv.get_response()
+            repo_name = resp.raw_text.strip()
+            
+            if not repo_name:
+                await conv.send_message("❌ Invalid name")
                 return
-            buttons = [[Button.inline(e["key"], f"editkey_{service_id}_{e['key']}")] for e in envs]
-            await event.respond("Select a key to edit:", buttons=buttons)
-
-    @client.on(events.CallbackQuery(pattern=b"editkey_(.+?)_(.+)"))
-    @owner_only
-    async def edit_key_cb(event):
-        service_id = event.pattern_match.group(1).decode()
-        key = event.pattern_match.group(2).decode()
-        user_state[event.sender_id] = {"step": "env_edit_value", "data": {"service_id": service_id, "key": key}}
-        await event.answer()
-        await event.respond(f"Send the new value for `{key}`:")
-
-    @client.on(events.NewMessage())
-    @owner_only
-    async def text_router(event):
-        uid = event.sender_id
-        if uid not in user_state:
-            return
-        if event.raw_text.startswith("/"):
-            return
-
-        state = user_state[uid]
-        step = state["step"]
-        text = event.raw_text.strip()
-
-        if step == "await_tag":
-            state["data"]["tag"] = text
-            state["step"] = "await_owner_id"
-            await event.respond("Send the Render owner ID (starts with `usr-` or `tea-`):")
-
-        elif step == "await_owner_id":
-            state["data"]["owner_id"] = text
-            state["step"] = "await_api_key"
-            await event.respond("Send the Render API key:")
-
-        elif step == "await_api_key":
-            api_key = text
-            await event.respond("🔍 Verifying key...")
-            status, data = await verify_render_key(api_key)
-            if status == 200:
-                accounts = get_accounts()
-                tag = state["data"]["tag"]
-                accounts[tag] = {"owner_id": state["data"]["owner_id"], "api_key": api_key}
-                save_json(ACCOUNTS_FILE, accounts)
-                active_account[uid] = tag
-                await event.respond(f"✅ Account `{tag}` verified and saved. It's now your active account.")
+            
+            await conv.send_message(
+                "🔒 Choose privacy:",
+                buttons=[
+                    [Button.inline("🌐 Public", b"privacy:public"), Button.inline("🔒 Private", b"privacy:private")]
+                ]
+            )
+            
+            cb_event = await conv.wait_event(events.CallbackQuery(func=lambda e: e.sender_id == OWNER_ID))
+            privacy = cb_event.data.decode().split(":")[1]
+            await cb_event.answer()
+            is_private = privacy == "private"
+            
+            await conv.send_message(f"⏳ Creating `{repo_name}` ({privacy})...", parse_mode="markdown")
+            
+            data = await gh_create_repo(token, repo_name, is_private)
+            
+            if data:
+                full_name = data.get("full_name")
+                update_workspace(OWNER_ID, active_repo=full_name, current_path="")
+                url = data.get("html_url")
+                await conv.send_message(
+                    f"✅ **Repository Created!**\n\n"
+                    f"📦 **{full_name}**\n"
+                    f"🔗 [Open on GitHub]({url})\n"
+                    f"🔄 Set as active repo",
+                    parse_mode="markdown"
+                )
             else:
-                await event.respond(f"❌ Verification failed. Status: {status}\nReason: {data}")
-            del user_state[uid]
+                await conv.send_message("❌ Failed to create repo")
+    except asyncio.TimeoutError:
+        await event.respond("⌛ Timeout")
+    except Exception as e:
+        await event.respond(f"❌ Error: {e}")
 
-        elif step == "env_await_service":
-            services = get_services()
-            service_id = services.get(text, {}).get("service_id", text)
-            buttons = [
-                [Button.inline("📄 View Env", f"env_view_{service_id}")],
-                [Button.inline("➕ Add New", f"env_add_{service_id}")],
-                [Button.inline("✏️ Edit Existing", f"env_edit_{service_id}")],
-            ]
-            await event.respond("Choose an action:", buttons=buttons)
-            del user_state[uid]
+# ============================================================
+# /switch_repo (6 per page)
+# ============================================================
+REPOS_CACHE = {}
 
-        elif step == "env_add_key":
-            state["data"]["key"] = text
-            state["step"] = "env_add_value"
-            await event.respond("Send the VALUE:")
-
-        elif step == "env_add_value":
-            service_id = state["data"]["service_id"]
-            key = state["data"]["key"]
-            value = text
-            tag, api_key = get_active_key(uid)
-            status, envs = await render_get_env(api_key, service_id)
-            if status != 200:
-                await event.respond(f"❌ Could not fetch existing env vars. Status: {status}")
-                del user_state[uid]
-                return
-            envs = [e for e in envs if e["key"] != key]
-            envs.append({"key": key, "value": value})
-            put_status, put_data = await render_put_env(api_key, service_id, envs)
-            if put_status == 200:
-                await event.respond(f"✅ `{key}` added/updated successfully.")
-            else:
-                await event.respond(f"❌ Failed to update. Status: {put_status}\n{put_data}")
-            del user_state[uid]
-
-        elif step == "env_edit_value":
-            service_id = state["data"]["service_id"]
-            key = state["data"]["key"]
-            value = text
-            tag, api_key = get_active_key(uid)
-            status, envs = await render_get_env(api_key, service_id)
-            if status != 200:
-                await event.respond(f"❌ Could not fetch existing env vars. Status: {status}")
-                del user_state[uid]
-                return
-            for e in envs:
-                if e["key"] == key:
-                    e["value"] = value
-            put_status, put_data = await render_put_env(api_key, service_id, envs)
-            if put_status == 200:
-                await event.respond(f"✅ `{key}` updated successfully.")
-            else:
-                await event.respond(f"❌ Failed to update. Status: {put_status}\n{put_data}")
-            del user_state[uid]
-
-        elif step == "create_await_name":
-            state["data"]["name"] = text
-            state["step"] = "create_await_repo"
-            await event.respond("Send the GitHub repo URL:")
-
-        elif step == "create_await_repo":
-            repo_url = text
-            name = state["data"]["name"]
-            tag, api_key = get_active_key(uid)
-            accounts = get_accounts()
-            owner_id = accounts[tag]["owner_id"]
-
-            env_vars = []
-            status, data = await render_create_service(api_key, name, repo_url, owner_id, env_vars)
-            if status not in (200, 201):
-                await event.respond(f"❌ Creation failed. Status: {status}\n{data}")
-                del user_state[uid]
-                return
-
-            service_id = data.get("service", {}).get("id") or data.get("id")
-            service_url = data.get("service", {}).get("serviceDetails", {}).get("url", "")
-
-            services = get_services()
-            services[name] = {"service_id": service_id, "account_tag": tag}
-            save_json(SERVICES_FILE, services)
-
-            ur_result = None
-            if service_url:
-                ur_result = await uptimerobot_create_monitor(service_url, name)
-
-            msg = f"✅ Service `{name}` created (ID: `{service_id}`)."
-            if ur_result:
-                msg += f"\nUptimeRobot: {ur_result.get('stat', 'unknown')}"
+async def show_repos_page(event, page=0, edit=False):
+    acc = get_account(OWNER_ID)
+    if not acc or not acc.get("gh_token"):
+        await event.respond("⚠️ No account linked")
+        return
+    
+    if OWNER_ID not in REPOS_CACHE:
+        repos = await gh_list_repos(acc["gh_token"])
+        REPOS_CACHE[OWNER_ID] = repos
+    
+    repos = REPOS_CACHE.get(OWNER_ID, [])
+    if not repos:
+        msg = "📭 No repositories found"
+        if edit:
+            await event.edit(msg)
+        else:
             await event.respond(msg)
-            del user_state[uid]
-
-        elif step == "op_await_target":
-            verb = state["data"]["action"]
-            fn_map = {"deployed": render_deploy, "suspended": render_suspend, "resumed": render_resume}
-            await run_action_for_target(event, text, fn_map[verb], verb)
-            del user_state[uid]
-
-
-async def resolve_and_run(event, action_fn, verb):
-    arg = event.pattern_match.group(1)
-    if not arg:
-        user_state[event.sender_id] = {"step": "op_await_target", "data": {"action": verb}}
-        await event.respond(f"Send the service name or ID to {verb.rstrip('ed')}:")
         return
-    await run_action_for_target(event, arg.strip(), action_fn, verb)
-
-async def run_action_for_target(event, identifier, action_fn, verb):
-    tag, api_key = get_active_key(event.sender_id)
-    if not api_key:
-        await event.respond("⚠️ No active account selected. Use /accounts first.")
-        return
-    services = get_services()
-    service_id = services.get(identifier, {}).get("service_id", identifier)
-    status, data = await action_fn(api_key, service_id)
-    if status in (200, 201, 202):
-        await event.respond(f"✅ Service `{identifier}` {verb} successfully.")
+    
+    per_page = 6
+    total = (len(repos) + per_page - 1) // per_page
+    page = max(0, min(page, total - 1))
+    start = page * per_page
+    chunk = repos[start:start + per_page]
+    
+    buttons = []
+    for repo in chunk:
+        full_name = repo.get("full_name")
+        buttons.append([Button.inline(f"📦 {full_name}", cb_data("select_repo", full_name))])
+    
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("⬅️ Prev", cb_data("repos_page", page - 1)))
+    if page < total - 1:
+        nav.append(Button.inline("➡️ Next", cb_data("repos_page", page + 1)))
+    if nav:
+        buttons.append(nav)
+    
+    text = f"📂 Select Repository (Page {page + 1}/{total})"
+    
+    if edit:
+        await event.edit(text, buttons=buttons)
     else:
-        await event.respond(f"❌ Failed to {verb.rstrip('ed')} `{identifier}`. Status: {status}\n{data}")
+        await event.respond(text, buttons=buttons)
 
-# ---------------- Keep-alive HTTP server ----------------
-async def handle_root(request):
-    return web.Response(text="Bot is alive", status=200)
+@bot.on(events.NewMessage(pattern=r"^/switch_repo$"))
+@owner_only
+async def switch_repo_handler(event):
+    msg = await event.respond("⏳ Loading repos...")
+    acc = get_account(OWNER_ID)
+    if acc and acc.get("gh_token"):
+        REPOS_CACHE[OWNER_ID] = await gh_list_repos(acc["gh_token"])
+    await show_repos_page(msg, 0, edit=True)
 
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", handle_root)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    log.info(f"Web server running on 0.0.0.0:{PORT}")
+@bot.on(events.CallbackQuery(pattern=rb"^select_repo:"))
+@owner_only
+async def select_repo_callback(event):
+    token = event.data.decode().split(":", 1)[1]
+    repo = cb_get(token)
+    if not repo:
+        await event.answer("⚠️ Expired", alert=True)
+        return
+    
+    update_workspace(OWNER_ID, active_repo=repo, current_path="")
+    await event.answer()
+    await event.respond(f"✅ Switched to **{repo}**", parse_mode="markdown")
 
-# ---------------- Main ----------------
+@bot.on(events.CallbackQuery(pattern=rb"^repos_page:"))
+@owner_only
+async def repos_page_callback(event):
+    token = event.data.decode().split(":", 1)[1]
+    page = cb_get(token)
+    if page is None:
+        await event.answer("⚠️ Expired", alert=True)
+        return
+    await event.answer()
+    await show_repos_page(event, page, edit=True)
+
+# ============================================================
+# /files
+# ============================================================
+@bot.on(events.NewMessage(pattern=r"^/files$"))
+@owner_only
+async def files_handler(event):
+    acc = get_account(OWNER_ID)
+    if not acc or not acc.get("gh_token"):
+        await event.respond("⚠️ No account linked")
+        return
+    
+    ws = get_workspace(OWNER_ID)
+    active_repo = ws.get("active_repo")
+    
+    if not active_repo:
+        await event.respond("⚠️ No active repo. Use /switch_repo")
+        return
+    
+    msg = await event.respond("⏳ Loading...")
+    
+    path = ws.get("current_path", "")
+    contents = await gh_get_contents(acc["gh_token"], active_repo, path)
+    
+    if not contents:
+        await msg.edit(f"❌ Path not found")
+        return
+    
+    if not isinstance(contents, list):
+        contents = [contents]
+    
+    buttons = await render_file_buttons(contents, path)
+    label = path if path else "/ (root)"
+    text = f"📂 **{active_repo}**\nPath: `{label}`"
+    
+    await msg.edit(text, buttons=buttons, parse_mode="markdown")
+
+@bot.on(events.CallbackQuery(pattern=rb"^nav:"))
+@owner_only
+async def nav_callback(event):
+    token = event.data.decode().split(":", 1)[1]
+    path = cb_get(token)
+    
+    if path is None:
+        await event.answer("⚠️ Expired", alert=True)
+        return
+    
+    acc = get_account(OWNER_ID)
+    ws = get_workspace(OWNER_ID)
+    repo = ws.get("active_repo")
+    
+    if not repo:
+        await event.answer("⚠️ No repo selected", alert=True)
+        return
+    
+    update_workspace(OWNER_ID, current_path=path)
+    
+    contents = await gh_get_contents(acc["gh_token"], repo, path)
+    if not contents:
+        await event.answer("❌ Path not found", alert=True)
+        return
+    
+    if not isinstance(contents, list):
+        contents = [contents]
+    
+    buttons = await render_file_buttons(contents, path)
+    label = path if path else "/ (root)"
+    text = f"📂 **{repo}**\nPath: `{label}`"
+    
+    await event.answer()
+    await event.edit(text, buttons=buttons, parse_mode="markdown")
+
+@bot.on(events.CallbackQuery(pattern=rb"^file:"))
+@owner_only
+async def file_selected_callback(event):
+    token = event.data.decode().split(":", 1)[1]
+    path = cb_get(token)
+    
+    if path is None:
+        await event.answer("⚠️ Expired", alert=True)
+        return
+    
+    await event.answer()
+    buttons = [
+        [Button.inline("📄 View", cb_data("view", path))],
+        [Button.inline("✏️ Edit", cb_data("edit", path))],
+        [Button.inline("➕ Append", cb_data("append", path))],
+        [Button.inline("🗑️ Delete", cb_data("delete", path))]
+    ]
+    
+    await event.respond(f"🗂️ **{path}**", buttons=buttons, parse_mode="markdown")
+
+# ============================================================
+# FILE OPERATIONS
+# ============================================================
+@bot.on(events.CallbackQuery(pattern=rb"^view:"))
+@owner_only
+async def view_callback(event):
+    token = event.data.decode().split(":", 1)[1]
+    path = cb_get(token)
+    
+    if not path:
+        await event.answer("⚠️ Expired", alert=True)
+        return
+    
+    await event.answer()
+    
+    acc = get_account(OWNER_ID)
+    ws = get_workspace(OWNER_ID)
+    
+    data = await gh_get_contents(acc["gh_token"], ws["active_repo"], path)
+    if not data or "content" not in data:
+        await event.respond("❌ Could not fetch file")
+        return
+    
+    try:
+        content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+    except:
+        await event.respond("❌ Could not decode")
+        return
+    
+    if len(content) > 3500:
+        content = content[:3500] + "\n...[truncated]"
+    
+    await event.respond(f"```\n{content}\n```", parse_mode="markdown")
+
+@bot.on(events.CallbackQuery(pattern=rb"^edit:"))
+@owner_only
+async def edit_callback(event):
+    token = event.data.decode().split(":", 1)[1]
+    path = cb_get(token)
+    
+    if not path:
+        await event.answer("⚠️ Expired", alert=True)
+        return
+    
+    await event.answer()
+    await edit_file_flow(event.chat_id, path)
+
+@bot.on(events.CallbackQuery(pattern=rb"^append:"))
+@owner_only
+async def append_callback(event):
+    token = event.data.decode().split(":", 1)[1]
+    path = cb_get(token)
+    
+    if not path:
+        await event.answer("⚠️ Expired", alert=True)
+        return
+    
+    await event.answer()
+    await append_file_flow(event.chat_id, path)
+
+@bot.on(events.CallbackQuery(pattern=rb"^delete:"))
+@owner_only
+async def delete_callback(event):
+    token = event.data.decode().split(":", 1)[1]
+    path = cb_get(token)
+    
+    if not path:
+        await event.answer("⚠️ Expired", alert=True)
+        return
+    
+    await event.answer()
+    
+    acc = get_account(OWNER_ID)
+    ws = get_workspace(OWNER_ID)
+    
+    data = await gh_get_contents(acc["gh_token"], ws["active_repo"], path)
+    if not data or "sha" not in data:
+        await event.respond("❌ Not found")
+        return
+    
+    msg = await event.respond("⏳ Deleting...")
+    ok = await gh_delete_file(acc["gh_token"], ws["active_repo"], path, data["sha"])
+    
+    if ok:
+        await msg.edit(f"✅ Deleted: `{path}`", parse_mode="markdown")
+    else:
+        await msg.edit(f"❌ Failed", parse_mode="markdown")
+
+async def edit_file_flow(chat_id, path):
+    acc = get_account(OWNER_ID)
+    ws = get_workspace(OWNER_ID)
+    
+    try:
+        async with bot.conversation(chat_id, timeout=180) as conv:
+            await conv.send_message(f"✏️ Send new content for `{path}`:", parse_mode="markdown")
+            resp = await conv.get_response()
+            new_content = resp.raw_text
+            
+            data = await gh_get_contents(acc["gh_token"], ws["active_repo"], path)
+            if not data or "sha" not in data:
+                await conv.send_message("❌ File SHA not found")
+                return
+            
+            await conv.send_message("⏳ Uploading...")
+            result = await gh_put_file(acc["gh_token"], ws["active_repo"], path, new_content, f"Edit {path}", data["sha"])
+            
+            if result:
+                await conv.send_message(f"✅ Updated: `{path}`", parse_mode="markdown")
+            else:
+                await conv.send_message("❌ Upload failed")
+    except asyncio.TimeoutError:
+        await bot.send_message(chat_id, "⌛ Timeout")
+    except Exception as e:
+        await bot.send_message(chat_id, f"❌ Error: {e}")
+
+async def append_file_flow(chat_id, path):
+    acc = get_account(OWNER_ID)
+    ws = get_workspace(OWNER_ID)
+    
+    try:
+        async with bot.conversation(chat_id, timeout=180) as conv:
+            await conv.send_message(f"➕ Send text to append to `{path}`:", parse_mode="markdown")
+            resp = await conv.get_response()
+            append_text = resp.raw_text
+            
+            data = await gh_get_contents(acc["gh_token"], ws["active_repo"], path)
+            if not data or "content" not in data:
+                await conv.send_message("❌ Could not fetch file")
+                return
+            
+            try:
+                existing = base64.b64decode(data["content"]).decode()
+            except:
+                existing = ""
+            
+            sha = data.get("sha")
+            new_content = existing.rstrip("\n") + "\n" + append_text
+            
+            await conv.send_message("⏳ Uploading...")
+            result = await gh_put_file(acc["gh_token"], ws["active_repo"], path, new_content, f"Append to {path}", sha)
+            
+            if result:
+                await conv.send_message(f"✅ Appended: `{path}`", parse_mode="markdown")
+            else:
+                await conv.send_message("❌ Upload failed")
+    except asyncio.TimeoutError:
+        await bot.send_message(chat_id, "⌛ Timeout")
+    except Exception as e:
+        await bot.send_message(chat_id, f"❌ Error: {e}")
+
+# ============================================================
+# /create_file
+# ============================================================
+@bot.on(events.NewMessage(pattern=r"^/create_file$"))
+@owner_only
+async def create_file_handler(event):
+    acc = get_account(OWNER_ID)
+    if not acc or not acc.get("gh_token"):
+        await event.respond("⚠️ No account linked")
+        return
+    
+    ws = get_workspace(OWNER_ID)
+    if not ws.get("active_repo"):
+        await event.respond("⚠️ No active repo")
+        return
+    
+    chat_id = event.chat_id
+    try:
+        async with bot.conversation(chat_id, timeout=180) as conv:
+            await conv.send_message("📝 Send file path (e.g. `src/main.py`):", parse_mode="markdown")
+            resp = await conv.get_response()
+            file_path = resp.raw_text.strip()
+            
+            if not file_path:
+                await conv.send_message("❌ Invalid path")
+                return
+            
+            await conv.send_message("✍️ Send content:")
+            resp = await conv.get_response()
+            content = resp.raw_text
+            
+            await conv.send_message("⏳ Creating...")
+            result = await gh_put_file(acc["gh_token"], ws["active_repo"], file_path, content, f"Create {file_path}")
+            
+            if result:
+                await conv.send_message(f"✅ Created: `{file_path}`", parse_mode="markdown")
+            else:
+                await conv.send_message("❌ Failed")
+    except asyncio.TimeoutError:
+        await event.respond("⌛ Timeout")
+    except Exception as e:
+        await event.respond(f"❌ Error: {e}")
+
+# ============================================================
+# /repo_info
+# ============================================================
+@bot.on(events.NewMessage(pattern=r"^/repo_info$"))
+@owner_only
+async def repo_info_handler(event):
+    acc = get_account(OWNER_ID)
+    if not acc or not acc.get("gh_token"):
+        await event.respond("⚠️ No account linked")
+        return
+    
+    ws = get_workspace(OWNER_ID)
+    repo = ws.get("active_repo")
+    
+    if not repo:
+        await event.respond("⚠️ No active repo")
+        return
+    
+    msg = await event.respond("⏳ Fetching info...")
+    data = await gh_get_repo_info(acc["gh_token"], repo)
+    
+    if not data:
+        await msg.edit("❌ Could not fetch repo info")
+        return
+    
+    desc = data.get("description", "No description")
+    url = data.get("html_url")
+    stars = data.get("stargazers_count", 0)
+    forks = data.get("forks_count", 0)
+    language = data.get("language", "Unknown")
+    topics = ", ".join(data.get("topics", []))
+    
+    text = (
+        f"📦 **{repo}**\n\n"
+        f"📝 `{desc}`\n"
+        f"⭐ Stars: `{stars}`\n"
+        f"🍴 Forks: `{forks}`\n"
+        f"💻 Language: `{language}`\n"
+        f"🏷️ Topics: `{topics if topics else 'None'}`\n\n"
+        f"[🔗 Open Repository]({url})"
+    )
+    
+    await msg.edit(text, parse_mode="markdown")
+
+# ============================================================
+# /repo_stats
+# ============================================================
+@bot.on(events.NewMessage(pattern=r"^/repo_stats$"))
+@owner_only
+async def repo_stats_handler(event):
+    acc = get_account(OWNER_ID)
+    if not acc or not acc.get("gh_token"):
+        await event.respond("⚠️ No account linked")
+        return
+    
+    ws = get_workspace(OWNER_ID)
+    repo = ws.get("active_repo")
+    
+    if not repo:
+        await event.respond("⚠️ No active repo")
+        return
+    
+    msg = await event.respond("⏳ Calculating stats...")
+    data = await gh_get_repo_info(acc["gh_token"], repo)
+    
+    if not data:
+        await msg.edit("❌ Could not fetch stats")
+        return
+    
+    stars = data.get("stargazers_count", 0)
+    forks = data.get("forks_count", 0)
+    watchers = data.get("watchers_count", 0)
+    open_issues = data.get("open_issues_count", 0)
+    size = data.get("size", 0)
+    pushed = data.get("pushed_at", "Unknown")
+    
+    text = (
+        f"📊 **Repository Statistics**\n\n"
+        f"⭐ Stars: `{stars}`\n"
+        f"🍴 Forks: `{forks}`\n"
+        f"👁️ Watchers: `{watchers}`\n"
+        f"❌ Open Issues: `{open_issues}`\n"
+        f"📦 Size: `{size}KB`\n"
+        f"⏱️ Last Push: `{pushed}`"
+    )
+    
+    await msg.edit(text, parse_mode="markdown")
+
+# ============================================================
+# MAIN
+# ============================================================
 async def main():
-    global client
-    client = TelegramClient("render_manager_bot", API_ID, API_HASH)
-    register_handlers()
-    await start_web_server()
-    await client.start(bot_token=BOT_TOKEN)
-    log.info("Bot started.")
-    await client.run_until_disconnected()
+    threading.Thread(target=run_health_server, daemon=True).start()
+    await bot.start(bot_token=BOT_TOKEN)
+    print("[+] GitHub Repo Manager Pro Running on Port", PORT)
+    await bot.run_until_disconnected()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop.run_until_complete(main())
